@@ -26,7 +26,7 @@ impl LineSource for RandomSource {
             ContentKind::Code => lines::code_line(lang, ctx.layout, |_| 0.0, rng),
             ContentKind::Words => {
                 let words = Corpus::get().words(lang, ctx.pool.vocabulary);
-                lines::weighted_word_line(words, |w| w.freq.sqrt(), ctx.layout, ctx.recent, lang, rng)
+                lines::weighted_word_line(words, |_, w| w.freq.sqrt(), ctx.layout, ctx.recent, lang, rng)
             }
         }
     }

@@ -1,7 +1,11 @@
 //! Trainers decide what to type next. The ML planner is the real one; the others are
 //! baselines used as fallbacks and as yardsticks in the benchmarks.
 
+pub mod bandit;
+pub mod gains;
+pub mod heuristic;
 pub mod lines;
+pub mod planner;
 pub mod random;
 
 use crate::content::Pool;

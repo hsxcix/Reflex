@@ -63,7 +63,7 @@ def casing_counts(sentences: list[str], letters: str) -> dict[str, collections.C
     return counts
 
 
-def build_words(lang: str, sentences: list[str]) -> list[tuple[str, int]]:
+def build_words(lang: str, sentences: list[str], names: set[str]) -> list[tuple[str, int]]:
     letters = LETTERS[lang]
     valid = re.compile(rf"^[{letters}]+$")
     casings = casing_counts(sentences, letters)
@@ -83,6 +83,8 @@ def build_words(lang: str, sentences: list[str]) -> list[tuple[str, int]]:
         if lang == "en" and form[0].isupper() and form != "I":
             continue  # proper nouns
         if lang == "de" and form[0].isupper():
+            if word in names:
+                continue  # capitalised in English too: a name, not a German noun
             form = form[0] + form[1:].lower()
         words.append((form, int(count)))
         if len(words) == WORDS_PER_LANG:
@@ -112,9 +114,11 @@ def write_zst(path: pathlib.Path, text: str) -> None:
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    english = casing_counts(load_sentences("eng"), LETTERS["en"])
+    names = {w for w, c in english.items() if c.most_common(1)[0][0][0].isupper()}
     for lang, lang3 in (("de", "deu"), ("en", "eng")):
         sentences = load_sentences(lang3)
-        words = build_words(lang, sentences)
+        words = build_words(lang, sentences, names)
         picked = build_sentences(lang, sentences)
         write_zst(OUT / f"{lang}_words.tsv.zst", "".join(f"{w}\t{c}\n" for w, c in words))
         write_zst(OUT / f"{lang}_sentences.txt.zst", "".join(s + "\n" for s in picked))

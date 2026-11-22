@@ -20,6 +20,7 @@ final class AppModel {
     private(set) var lineToken = 0
     private(set) var lastKeyAt = Date.distantPast
     private(set) var startupError: String?
+    private(set) var stats: Stats?
 
     @ObservationIgnored let engine: ReflexEngine?
     @ObservationIgnored private var hesitationTask: Task<Void, Never>?
@@ -86,7 +87,18 @@ final class AppModel {
 
     func showStats() {
         engine?.pause()
+        stats = try? engine?.stats()
         screen = .stats
+    }
+
+    /// While the stats screen is open, refresh a few times so the forecast (computed in
+    /// the background) shows up.
+    func refreshStatsLoop() async {
+        for _ in 0..<6 {
+            try? await Task.sleep(for: .seconds(1.5))
+            guard screen == .stats else { return }
+            stats = try? engine?.stats()
+        }
     }
 
     func showTyping() {

@@ -41,6 +41,12 @@ pub struct Stroke {
 /// Index into [`KEY_CODES`].
 pub type KeyId = u8;
 
+/// A movement: key × layer × dead-key flag (see [`Layout::motor`]).
+pub type Motor = u16;
+
+/// Motor id used for "start of text" in pairs.
+pub const MOTOR_START: Motor = u16::MAX;
+
 /// All physical keys Reflex knows, in a fixed order (the order is part of the model's
 /// vocabulary, so only ever append).
 pub const KEY_CODES: [&str; 50] = [
@@ -164,6 +170,15 @@ impl Layout {
     /// The final (character-producing) stroke for `c`.
     pub fn main_stroke(&self, c: char) -> Option<Stroke> {
         self.strokes(c).and_then(|s| s.last().copied())
+    }
+
+    /// Motor id of the movement that produces `c`: physical key, modifier layer and
+    /// whether a dead key precedes it. Practice is tracked per movement, so skills
+    /// carry over between layouts exactly where the movements are the same.
+    pub fn motor(&self, c: char) -> Option<Motor> {
+        let strokes = self.strokes(c)?;
+        let main = strokes.last()?;
+        Some(main.key as Motor * 8 + main.layer as Motor + if strokes.len() > 1 { 4 } else { 0 })
     }
 
     pub fn key(&self, key: KeyId) -> KeyGeometry {

@@ -91,6 +91,61 @@ pub struct KeyHint {
     pub option: bool,
 }
 
+#[derive(uniffi::Record)]
+pub struct DayPoint {
+    /// Start of the day (ms since epoch, UTC).
+    pub day_ms: i64,
+    pub wpm: f64,
+    pub accuracy: f64,
+    pub real_wpm: Option<f64>,
+    pub minutes: f64,
+}
+
+#[derive(uniffi::Record)]
+pub struct ForecastPoint {
+    pub days: u32,
+    pub wpm: f64,
+    pub plus_minus: f64,
+}
+
+#[derive(uniffi::Record)]
+pub struct KeyHeat {
+    pub code: String,
+    /// 0 = fastest key, 1 = slowest key.
+    pub value: f64,
+    pub ms: f64,
+}
+
+#[derive(uniffi::Record)]
+pub struct PairStat {
+    pub text: String,
+    pub ms: f64,
+}
+
+#[derive(uniffi::Record)]
+pub struct Confusion {
+    pub expected: String,
+    pub typed: String,
+    pub count: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct Stats {
+    pub days: Vec<DayPoint>,
+    pub forecast: Vec<ForecastPoint>,
+    pub key_heat: Vec<KeyHeat>,
+    pub slow_pairs: Vec<PairStat>,
+    pub confusions: Vec<Confusion>,
+    pub real_wpm: Option<f64>,
+    /// 0…1: how sure the typist model is about you.
+    pub confidence: f64,
+    pub model_ready: bool,
+    pub streak_days: u32,
+    pub total_minutes: f64,
+    pub today_minutes: f64,
+    pub total_keystrokes: i64,
+}
+
 #[derive(uniffi::Object)]
 pub struct ReflexEngine {
     engine: Mutex<Engine>,
@@ -130,7 +185,7 @@ impl ReflexEngine {
             wall_ms: engine::now_ms(),
             is_dead: event.is_dead,
         };
-        let (outcome, summary, _lines) = self.lock().key(input)?;
+        let (outcome, summary) = self.lock().key(input)?;
         Ok(KeyResult {
             correct: outcome.correct,
             advanced: outcome.advanced,
@@ -146,7 +201,7 @@ impl ReflexEngine {
     }
 
     pub fn view(&self) -> TypingView {
-        let engine = self.lock();
+        let mut engine = self.lock();
         let v = engine.view();
         TypingView {
             lines: v.lines,
@@ -220,6 +275,68 @@ impl ReflexEngine {
             finger: layout.key(main.key).finger.index() as u8,
             shift: main.layer.shift(),
             option: strokes.iter().any(|s| s.layer.option()),
+        })
+    }
+
+    /// Everything the progress screen shows. Also asks the learning thread for a fresh
+    /// forecast, which shows up in a later call.
+    pub fn stats(&self) -> Result<Stats, ReflexError> {
+        let mut engine = self.lock();
+        engine.request_forecast();
+        let batches = engine.store().batches()?;
+        let confusions = engine.store().confusions(8)?;
+        let total_keystrokes = engine.store().total_chars()?;
+        let today_minutes = engine.today_minutes();
+        let layout = engine.layout().clone();
+        let insights = engine.insights();
+        let gains = insights.gains.clone();
+        let mut days: Vec<DayPoint> = Vec::new();
+        for b in &batches {
+            let day_ms = b.ended_ms / 86_400_000 * 86_400_000;
+            match days.last_mut() {
+                Some(d) if d.day_ms == day_ms => {
+                    let w = d.minutes / (d.minutes + b.seconds / 60.0);
+                    d.wpm = d.wpm * w + b.wpm * (1.0 - w);
+                    d.accuracy = d.accuracy * w + b.accuracy * (1.0 - w);
+                    d.minutes += b.seconds / 60.0;
+                    d.real_wpm = b.real_wpm.or(d.real_wpm);
+                }
+                _ => days.push(DayPoint { day_ms, wpm: b.wpm, accuracy: b.accuracy, real_wpm: b.real_wpm, minutes: b.seconds / 60.0 }),
+            }
+        }
+        let key_heat = gains.as_ref().map_or_else(Vec::new, |g| {
+            let (lo, hi) = g.key_cost.values().fold((f32::MAX, 0.0f32), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+            g.key_cost
+                .iter()
+                .map(|(k, v)| KeyHeat {
+                    code: KEY_CODES[*k as usize].to_string(),
+                    value: if hi > lo { ((v - lo) / (hi - lo)) as f64 } else { 0.0 },
+                    ms: *v as f64,
+                })
+                .collect()
+        });
+        let label = |k: u8| layout.label(k, Layer::Base).filter(|l| !l.is_empty()).unwrap_or_else(|| KEY_CODES[k as usize].to_string());
+        Ok(Stats {
+            forecast: insights
+                .forecast
+                .as_ref()
+                .map_or_else(Vec::new, |f| f.points.iter().map(|(d, w, pm)| ForecastPoint { days: *d, wpm: *w, plus_minus: *pm }).collect()),
+            key_heat,
+            slow_pairs: gains.as_ref().map_or_else(Vec::new, |g| {
+                g.slow_pairs.iter().map(|(t, ms)| PairStat { text: t.clone(), ms: *ms as f64 }).collect()
+            }),
+            confusions: confusions
+                .into_iter()
+                .map(|(e, k, n)| Confusion { expected: e, typed: label(k), count: n })
+                .collect(),
+            real_wpm: gains.as_ref().map(|g| g.real_wpm).filter(|w| *w > 0.0),
+            confidence: gains.as_ref().map_or(0.0, |g| (1.0 - 4.0 * g.uncertainty_ratio as f64).clamp(0.0, 1.0)),
+            model_ready: insights.model_ready,
+            streak_days: crate::stats::streak_days(&batches, engine::now_ms()),
+            total_minutes: batches.iter().map(|b| b.seconds).sum::<f64>() / 60.0,
+            today_minutes,
+            total_keystrokes,
+            days,
         })
     }
 

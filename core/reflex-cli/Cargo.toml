@@ -15,4 +15,6 @@ gpu = ["reflex-core/gpu"]
 [dependencies]
 reflex-core = { path = "../reflex-core" }
 clap.workspace = true
+burn.workspace = true
+rand.workspace = true
 serde_json.workspace = true

@@ -34,11 +34,11 @@ impl RecentWords {
     }
 }
 
-/// Build a line by repeatedly sampling words proportional to `weight(word)`.
+/// Build a line by repeatedly sampling words proportional to `weight(index, word)`.
 /// Words that can't be typed on `layout` or were shown recently are skipped.
 pub fn weighted_word_line(
     words: &[Word],
-    weight: impl Fn(&Word) -> f64,
+    weight: impl Fn(usize, &Word) -> f64,
     layout: &Layout,
     recent: &RecentWords,
     lang: Lang,
@@ -46,8 +46,9 @@ pub fn weighted_word_line(
 ) -> PlannedLine {
     let candidates: Vec<(&Word, f64)> = words
         .iter()
-        .filter(|w| layout.can_type(&w.text) && !recent.contains(&w.text))
-        .map(|w| (w, weight(w).max(0.0)))
+        .enumerate()
+        .filter(|(_, w)| layout.can_type(&w.text) && !recent.contains(&w.text))
+        .map(|(i, w)| (w, weight(i, w).max(0.0)))
         .filter(|(_, wt)| *wt > 0.0)
         .collect();
     let mut line = String::new();

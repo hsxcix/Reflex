@@ -312,6 +312,23 @@ impl Store {
         Ok(sessions.len())
     }
 
+    /// Most frequent mistakes in the live data: (expected char, key hit instead, count).
+    pub fn confusions(&self, limit: usize) -> Result<Vec<(String, u8, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT substr(l.text, c.pos + 1, 1) AS expected, c.wrong_key, COUNT(*) AS n
+             FROM chars c JOIN lines l ON l.id = c.line_id
+             WHERE c.error = 1 AND c.wrong_key IS NOT NULL
+             GROUP BY expected, c.wrong_key ORDER BY n DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Total characters typed (live + archived batches).
+    pub fn total_chars(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(SUM(chars), 0) FROM batches", [], |r| r.get(0))?)
+    }
+
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
