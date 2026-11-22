@@ -1,0 +1,8 @@
+/core/target/
+/mac/.build/
+/build/
+*.app
+.DS_Store
+/mac/Sources/ReflexMac/Generated/
+/mac/Sources/ReflexCoreFFI/reflex_coreFFI.h
+/mac/Sources/ReflexCoreFFI/module.modulemap
