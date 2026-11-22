@@ -94,9 +94,10 @@ impl Engine {
         let recent_wpms = batches.iter().rev().take(10).map(|b| b.wpm).collect();
         let today_sec = today_seconds(&batches);
         let layout = Layout::new(LayoutId::DeIso, Geometry::Iso);
-        let personal = data_dir.join("models/typist.bpk");
+        let personal = data_dir.join(format!("models/typist-v{}.bpk", crate::model::MODEL_VERSION));
         let (jobs, updates) = worker::spawn(WorkerSetup {
             model_paths: vec![personal.clone(), resources_dir.join("models/typist.bpk")],
+            prior_path: resources_dir.join("models/bandit_prior.json"),
             save_path: personal,
             history: store.typed_lines()?,
             trials,
@@ -249,11 +250,10 @@ impl Engine {
                 self.source = Box::new(planner);
                 self.insights.model_ready = true;
             }
-            if let Some(trials) = update.trials {
-                if let Ok(json) = serde_json::to_string(&trials) {
+            if let Some(trials) = update.trials
+                && let Ok(json) = serde_json::to_string(&trials) {
                     self.store.set_setting(TRIALS_KEY, &json).ok();
                 }
-            }
             self.insights.gains = Some(update.gains);
             if update.forecast.is_some() {
                 self.insights.forecast = update.forecast;

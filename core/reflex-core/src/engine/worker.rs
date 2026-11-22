@@ -33,6 +33,7 @@ pub struct Update {
 
 pub struct WorkerSetup {
     pub model_paths: Vec<PathBuf>,
+    pub prior_path: PathBuf,
     pub save_path: PathBuf,
     pub history: Vec<TypedLine>,
     pub trials: Vec<Trial>,
@@ -56,7 +57,7 @@ fn run(setup: WorkerSetup, jobs: Receiver<Job>, updates: Sender<Update>) {
     let (model, trained) = Brain::load_model(&paths);
     let mut brain = Brain::new(model, setup.now_ms as u64);
     brain.observe(&setup.history);
-    brain.restore_trials(setup.trials);
+    brain.restore_trials(setup.trials, Brain::load_prior(&setup.prior_path));
     let send = |brain: &Brain, trials: bool, forecast: Option<Forecast>| {
         updates
             .send(Update {

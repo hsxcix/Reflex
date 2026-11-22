@@ -1,6 +1,6 @@
 # Reflex — Plan (v1: Typing)
 
-Status: **final**, 22.11.2026 (rev. 4). Ready to implement autonomously. Nothing implemented yet.
+Status: **v1 implemented** 22.11.2026 (plan rev. 4). Deviations and benchmark results: DECISIONS.md.
 
 ## Goal
 

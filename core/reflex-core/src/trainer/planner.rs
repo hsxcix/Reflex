@@ -20,18 +20,18 @@ pub struct Knobs {
     pub temperature: f64,
     /// Share of natural sentences (also keeps "real speed" measurable).
     pub natural_share: f64,
-    /// Weight of model uncertainty (exploration bonus).
+    /// Weight of model uncertainty (exploration bonus, relative to predicted gain).
     pub explore: f64,
 }
 
 /// The arms the bandit can pick (focus × natural share).
 pub const ARMS: [Knobs; 6] = [
-    Knobs { temperature: 0.35, natural_share: 0.2, explore: 0.5 },
-    Knobs { temperature: 0.7, natural_share: 0.2, explore: 0.5 },
-    Knobs { temperature: 1.4, natural_share: 0.2, explore: 0.5 },
-    Knobs { temperature: 0.35, natural_share: 0.45, explore: 0.5 },
-    Knobs { temperature: 0.7, natural_share: 0.45, explore: 0.5 },
-    Knobs { temperature: 1.4, natural_share: 0.45, explore: 0.5 },
+    Knobs { temperature: 0.35, natural_share: 0.2, explore: 0.12 },
+    Knobs { temperature: 0.7, natural_share: 0.2, explore: 0.12 },
+    Knobs { temperature: 1.4, natural_share: 0.2, explore: 0.12 },
+    Knobs { temperature: 0.35, natural_share: 0.45, explore: 0.12 },
+    Knobs { temperature: 0.7, natural_share: 0.45, explore: 0.12 },
+    Knobs { temperature: 1.4, natural_share: 0.45, explore: 0.12 },
 ];
 
 pub struct Planner {
@@ -58,7 +58,7 @@ impl Planner {
                 let repeat = seen.iter().filter(|k| **k == key).count() as f64;
                 let g = *self.gains.gain.get(&key).unwrap_or(&0.0) as f64;
                 let u = *self.gains.uncertainty.get(&key).unwrap_or(&0.0) as f64;
-                total += (g + self.knobs.explore * u * 0.01) / (1.0 + repeat);
+                total += (g + self.knobs.explore * u) / (1.0 + repeat);
                 seen.push(key);
             }
             n += 1;
@@ -113,5 +113,46 @@ impl LineSource for Planner {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::Pool;
+    use crate::layout::{Geometry, Layout};
+    use crate::trainer::lines::RecentWords;
+    use rand::SeedableRng;
+
+    #[test]
+    fn prefers_words_with_valuable_pairs() {
+        let layout = Layout::new(LayoutId::DeIso, Geometry::Iso);
+        let mut table = GainTable::default();
+        // Make every pair containing 'q' hugely valuable.
+        for prev in "abcdefghijklmnopqrstuvwxyz ".chars() {
+            for (a, b) in [(prev, 'q'), ('q', prev)] {
+                if let Some(key) = pair_key(&layout, Some(a), b) {
+                    table.gain.insert(key, 10.0);
+                }
+            }
+        }
+        let mut planner = Planner::new(Arc::new(table), ARMS[1]);
+        let pool = Pool { languages: vec![Lang::En], vocabulary: Vocabulary::Broad, code: false };
+        let mut recent = RecentWords::default();
+        let mut rng = StdRng::seed_from_u64(3);
+        let (mut q_words, mut words) = (0, 0);
+        for _ in 0..40 {
+            let ctx = PlanContext { pool: &pool, layout: &layout, recent: &recent };
+            let line = planner.next_line(&ctx, &mut rng);
+            recent.note_line(&line.text);
+            if line.kind == ContentKind::Words {
+                for w in line.text.split_whitespace() {
+                    words += 1;
+                    q_words += w.contains('q') as usize;
+                }
+            }
+        }
+        // 'q' words are well under 1% of English text.
+        assert!(q_words * 4 > words, "{q_words} of {words} words contain q");
     }
 }

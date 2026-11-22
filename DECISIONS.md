@@ -12,3 +12,13 @@ Decisions made during the autonomous build (newest last), with reasons.
 - **22.11.2026 · German word list drops names** (words capitalised in English text too, e.g. "Samantha").
 - **22.11.2026 · Fatigue hint uses measured speed drop**, not model residuals: simpler, robust, and the model already sees time-in-session as an input.
 - **22.11.2026 · Personal model is saved only when an update improves held-out predictions** (rollback otherwise); weights are read fully into memory so the file can be replaced safely.
+- **22.11.2026 · Exploration bonus on the same scale as gains.** Model uncertainty is aggregated per pair exactly like the predicted gain (frequency-weighted, per keystroke); before, a raw ms value drowned out the gain signal.
+- **22.11.2026 · Bandit starts from a simulation prior.** Its first dozen batches used to be uniformly random, which wastes a new user's first sessions. `reflex-cli train-bandit` collects outcomes on simulated typists (training families only) into `bandit_prior.json`; each prior trial counts ¼ of a real one, so the user's own outcomes take over quickly.
+- **22.11.2026 · Benchmark includes an oracle** (planner fed the simulator's true gains) as the upper bound: it shows how much any trainer can gain over random text in the simulator, and how much of that the ML captures.
+- **22.11.2026 · Sentences with names are skipped** (Tatoeba repeats Tom, Mary, Ziri constantly).
+- **22.11.2026 · Model v3 shipped** (1000 simulated typists, 17.9 M keystrokes, 10k GPU steps). "What if practised more" is asked with +12 repetitions (clearer signal than +4: top-30 overlap with the true most valuable pairs rose from ~30% to 37–50%).
+- **22.11.2026 · Benchmark results (honest).** Held-out typist families, 40 batches each:
+  - Prediction: fine-tuned model RMSE(log latency) 0.329 vs 0.406 for per-pair averages (−19%); pretrained-only 0.373.
+  - Training: ML +3.94 WPM vs +3.50 for random text and for the weakest-keys heuristic; ML ahead for every simulated person. Keystrokes saved vs random text: 23–28% across runs (target was ≥30%, **not reached yet**). Oracle upper bound: 48–52%.
+  - The remaining gap is in the gain estimates, not the planner or bandit (fixed-arm and bandit runs are within noise). Next lever: a model head trained directly on future improvement after practice.
+- **22.11.2026 · Not done in v1:** RL challenger policy (the neural bandit is the learned policy layer for now), layout-switch transfer benchmark, Linux test run (no Docker on this Mac; the core has no OS-specific code).

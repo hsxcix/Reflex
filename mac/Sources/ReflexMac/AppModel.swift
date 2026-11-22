@@ -18,13 +18,15 @@ final class AppModel {
     private(set) var batchToken = 0
     private(set) var errorToken = 0
     private(set) var lineToken = 0
-    private(set) var lastKeyAt = Date.distantPast
     private(set) var startupError: String?
     private(set) var stats: Stats?
 
     @ObservationIgnored let engine: ReflexEngine?
     @ObservationIgnored private var hesitationTask: Task<Void, Never>?
+    @ObservationIgnored private var idleTask: Task<Void, Never>?
+    @ObservationIgnored private var mouseTask: Task<Void, Never>?
     @ObservationIgnored private var layoutObserver: NSObjectProtocol?
+    @ObservationIgnored private var resignObserver: NSObjectProtocol?
 
     static let hesitationDelay: Duration = .milliseconds(1200)
 
@@ -45,17 +47,26 @@ final class AppModel {
         layoutObserver = InputSource.observe { [weak self] in
             MainActor.assumeIsolated { self?.applyInputSource() }
         }
+        // Switching to another app is a pause, not a slow keystroke.
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.engine?.pause() }
+        }
     }
 
-    var isTyping: Bool { Date().timeIntervalSince(lastKeyAt) < 2.5 }
+    /// True while keys are coming in; turns false 2.5 s after the last key.
+    private(set) var isTyping = false
+    /// True for a moment after the mouse moved (reveals the top bar while typing).
+    private(set) var mouseActive = false
 
     func handle(_ key: CapturedKey) {
         guard let engine, screen == .typing else { return }
         let event = KeyEvent(code: key.code, chars: key.chars, modifiers: key.modifiers,
                              timestampUs: key.timestampUs, isDead: key.isDead)
         guard let result = try? engine.keyEvent(event: event) else { return }
-        lastKeyAt = Date()
         hint = nil
+        markTyping()
         if !result.correct && !key.isDead { errorToken += 1 }
         if result.lineFinished { lineToken += 1 }
         if let batch = result.batch {
@@ -133,6 +144,26 @@ final class AppModel {
         engine.setLayout(layout: source.layout, geometry: source.geometry)
         keyboard = engine.keyboard()
         view = engine.view()
+    }
+
+    func mouseMoved() {
+        if !mouseActive { mouseActive = true }
+        mouseTask?.cancel()
+        mouseTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            self?.mouseActive = false
+        }
+    }
+
+    private func markTyping() {
+        if !isTyping { isTyping = true }
+        idleTask?.cancel()
+        idleTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            self?.isTyping = false
+        }
     }
 
     private func scheduleHesitationHint() {

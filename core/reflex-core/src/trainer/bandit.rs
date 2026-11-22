@@ -48,7 +48,12 @@ pub struct Bandit {
     net: ValueNet,
     device: Device,
     trials: Vec<Trial>,
+    /// Outcomes from simulated people: a starting belief, outweighed by own trials over time.
+    prior: Vec<Trial>,
 }
+
+/// Weight of one prior trial relative to one of the person's own trials.
+const PRIOR_WEIGHT: f32 = 0.25;
 
 /// Context the bandit conditions on.
 pub fn context(total_keystrokes: f64, real_wpm: f64, uncertainty: f32) -> [f32; N_CONTEXT] {
@@ -57,7 +62,7 @@ pub fn context(total_keystrokes: f64, real_wpm: f64, uncertainty: f32) -> [f32; 
 
 impl Bandit {
     pub fn new(device: &Device) -> Bandit {
-        Bandit { net: ValueNet::new(device), device: device.clone(), trials: Vec::new() }
+        Bandit { net: ValueNet::new(device), device: device.clone(), trials: Vec::new(), prior: Vec::new() }
     }
 
     pub fn trials(&self) -> &[Trial] {
@@ -72,7 +77,8 @@ impl Bandit {
 
     /// Thompson sampling over ensemble heads; explores uniformly while data is scarce.
     pub fn choose(&self, context: [f32; N_CONTEXT], rng: &mut StdRng) -> usize {
-        if self.trials.len() < ARMS.len() * 2 || rng.random::<f64>() < 0.08 {
+        let evidence = self.trials.len() + self.prior.len();
+        if evidence < ARMS.len() * 2 || rng.random::<f64>() < 0.08 {
             return rng.random_range(0..ARMS.len());
         }
         let head = rng.random_range(0..HEADS);
@@ -89,9 +95,10 @@ impl Bandit {
         self.fit(rng);
     }
 
-    pub fn restore(&mut self, trials: Vec<Trial>, rng: &mut StdRng) {
+    pub fn restore(&mut self, trials: Vec<Trial>, prior: Vec<Trial>, rng: &mut StdRng) {
         self.trials = trials;
-        if !self.trials.is_empty() {
+        self.prior = prior;
+        if !self.trials.is_empty() || !self.prior.is_empty() {
             self.fit(rng);
         }
     }
@@ -100,15 +107,20 @@ impl Bandit {
         let device = self.device.clone().autodiff();
         let mut net = self.net.clone().fork(&device).train();
         let mut optim = AdamConfig::new().init();
-        let recent: Vec<&Trial> = self.trials.iter().rev().take(400).collect();
-        let n = recent.len();
-        let x: Vec<f32> = recent.iter().flat_map(|t| Self::features(&t.context, t.arm)).collect();
-        let y: Vec<f32> = recent.iter().map(|t| t.reward.clamp(-5.0, 5.0)).collect();
+        let own = self.trials.iter().rev().take(400).map(|t| (t, 1.0));
+        let prior = self.prior.iter().map(|t| (t, PRIOR_WEIGHT));
+        let data: Vec<(&Trial, f32)> = own.chain(prior).collect();
+        let n = data.len();
+        let x: Vec<f32> = data.iter().flat_map(|(t, _)| Self::features(&t.context, t.arm)).collect();
+        let y: Vec<f32> = data.iter().map(|(t, _)| t.reward.clamp(-5.0, 5.0)).collect();
+        let weight: Vec<f32> = data.iter().map(|(_, w)| *w).collect();
         let x = Tensor::<2>::from_data(TensorData::new(x, [n, N_CONTEXT + ARMS.len()]), &device);
         let y = Tensor::<2>::from_data(TensorData::new(y, [n, 1]), &device);
         for _ in 0..40 {
             // Bootstrap: each head sees a different resample of the trials.
-            let w: Vec<f32> = (0..n * HEADS).map(|_| if rng.random::<f64>() < 0.632 { 1.0 } else { 0.0 }).collect();
+            let w: Vec<f32> = (0..n * HEADS)
+                .map(|i| if rng.random::<f64>() < 0.632 { weight[i / HEADS] } else { 0.0 })
+                .collect();
             let w = Tensor::<2>::from_data(TensorData::new(w, [n, HEADS]), &device);
             let pred = net.forward(x.clone());
             let loss = ((pred - y.clone()).powf_scalar(2.0) * w.clone()).sum() / (w.sum() + 1.0);

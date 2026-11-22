@@ -60,10 +60,9 @@ impl Brain {
     pub fn new(model: TypistModel, seed: u64) -> Brain {
         let device = crate::model::cpu();
         let model = model.fork(&device.clone().autodiff()).train();
-        let mut rng = StdRng::seed_from_u64(seed);
+        let rng = StdRng::seed_from_u64(seed);
         let replay = replay_set(seed);
-        let mut bandit = Bandit::new(&device);
-        bandit.restore(Vec::new(), &mut rng);
+        let bandit = Bandit::new(&device);
         Brain {
             device,
             model,
@@ -127,8 +126,14 @@ impl Brain {
         self.bandit.trials()
     }
 
-    pub fn restore_trials(&mut self, trials: Vec<Trial>) {
-        self.bandit.restore(trials, &mut self.rng);
+    /// Restore the person's bandit outcomes plus the simulation prior.
+    pub fn restore_trials(&mut self, trials: Vec<Trial>, prior: Vec<Trial>) {
+        self.bandit.restore(trials, prior, &mut self.rng);
+    }
+
+    /// Read a bandit prior (JSON list of trials) if present.
+    pub fn load_prior(path: &Path) -> Vec<Trial> {
+        std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
 
     fn layout_for(&mut self, id: LayoutId, geometry: crate::layout::Geometry) -> Layout {
@@ -149,7 +154,7 @@ impl Brain {
             let encoded = encode_typed_line(line, &layout, &self.history);
             record_line(&mut self.history, &layout, line);
             self.seen_lines += 1;
-            if self.seen_lines % VALID_EVERY == 0 {
+            if self.seen_lines.is_multiple_of(VALID_EVERY) {
                 self.valid_lines.push(encoded);
             } else {
                 self.train_lines.push(encoded);
@@ -171,7 +176,8 @@ impl Brain {
         let params = TrainParams { steps: self.fine_tune_steps, batch_size: 32, lr: 4e-4, replay_share: 0.3 };
         let candidate = train(self.model.clone(), &self.train_lines[start..], &self.replay, &params, &device, &mut self.rng, |_, _| {});
         let after = evaluate(&candidate, &valid, &device);
-        let kept = valid.is_empty() || !(after > before * 1.002);
+        // NaN (no validation data yet) counts as an improvement.
+        let kept = valid.is_empty() || after.is_nan() || after <= before * 1.002;
         if kept {
             self.model = candidate;
         }

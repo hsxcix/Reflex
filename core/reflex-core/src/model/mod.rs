@@ -11,6 +11,9 @@ use burn::tensor::Device;
 /// Number of ensemble heads.
 pub const ENSEMBLE: usize = 5;
 
+/// Bump whenever inputs or architecture change: personal models of other versions are ignored.
+pub const MODEL_VERSION: u32 = 3;
+
 /// CPU device for on-device inference and fine-tuning (small model, low latency).
 pub fn cpu() -> Device {
     Device::flex()

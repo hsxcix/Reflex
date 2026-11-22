@@ -11,7 +11,9 @@ use crate::model::encode::{encode_typed_line, record_line};
 use crate::record::TypedLine;
 use crate::sim::data::{SIM_START_MS, simulate_history};
 use crate::sim::{Family, SimTypist};
-use crate::trainer::gains::eval_texts;
+use crate::trainer::gains::{GainTable, eval_texts};
+use crate::trainer::planner::{ARMS, Planner};
+use std::sync::Arc;
 use crate::trainer::heuristic::WeakestKeys;
 use crate::trainer::lines::RecentWords;
 use crate::trainer::random::RandomSource;
@@ -25,6 +27,8 @@ pub enum TrainerKind {
     Random,
     Heuristic,
     Ml,
+    /// Plans with the simulator's true gains: the upper bound for any trainer.
+    Oracle,
 }
 
 impl TrainerKind {
@@ -33,6 +37,7 @@ impl TrainerKind {
             TrainerKind::Random => "random text",
             TrainerKind::Heuristic => "weakest keys",
             TrainerKind::Ml => "reflex ML",
+            TrainerKind::Oracle => "oracle",
         }
     }
 }
@@ -49,10 +54,12 @@ pub struct BenchConfig {
 pub struct Curve {
     pub start_wpm: f64,
     pub points: Vec<(usize, f64)>,
+    /// Bandit outcomes of the ML trainer (used to build the simulation prior).
+    pub trials: Vec<crate::trainer::bandit::Trial>,
 }
 
 /// Run one trainer on one simulated person from `family` (same seed → same person).
-pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConfig, model: &TypistModel) -> Curve {
+pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConfig, model: &TypistModel, prior: &[crate::trainer::bandit::Trial]) -> Curve {
     let mut rng = StdRng::seed_from_u64(seed);
     let layout = Layout::new(LayoutId::DeIso, Geometry::Iso);
     let params = family.sample(&layout, &mut rng);
@@ -66,6 +73,7 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
     let mut heuristic = WeakestKeys::default();
     let mut brain = (kind == TrainerKind::Ml).then(|| Brain::new(model.clone(), seed));
     if let Some(b) = brain.as_mut() {
+        b.restore_trials(Vec::new(), prior.to_vec());
         b.refresh(&layout, &pool, now);
     }
     let mut keystrokes = 0usize;
@@ -78,13 +86,16 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
             now += 86_400_000;
             session_sec = 0.0;
         }
-        let mut planner = brain.as_ref().map(|b| b.planner());
+        let mut planner = match kind {
+            TrainerKind::Oracle => Some(Planner::new(Arc::new(true_gains(&typist, &layout, &pool, now)), ARMS[1])),
+            _ => brain.as_ref().map(|b| b.planner()),
+        };
         let mut typed: Vec<TypedLine> = Vec::new();
         let batch_start_sec = session_sec;
         for _ in 0..cfg.lines_per_batch {
             let ctx = PlanContext { pool: &pool, layout: &layout, recent: &recent };
             let line = match (kind, planner.as_mut()) {
-                (TrainerKind::Ml, Some(p)) => p.next_line(&ctx, &mut rng_plan),
+                (TrainerKind::Ml | TrainerKind::Oracle, Some(p)) => p.next_line(&ctx, &mut rng_plan),
                 (TrainerKind::Heuristic, _) => heuristic.next_line(&ctx, &mut rng_plan),
                 _ => random.next_line(&ctx, &mut rng_plan),
             };
@@ -105,11 +116,12 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
                 real_before = real_after;
             }
             TrainerKind::Heuristic => heuristic.observe(&typed),
-            TrainerKind::Random => {}
+            TrainerKind::Random | TrainerKind::Oracle => {}
         }
         points.push((keystrokes, typist.true_wpm(&truth_texts, now)));
     }
-    Curve { start_wpm, points }
+    let trials = brain.map(|b| b.trials().to_vec()).unwrap_or_default();
+    Curve { start_wpm, points, trials }
 }
 
 /// Keystrokes `curve` needed to first reach `level` (None if never).
@@ -273,24 +285,9 @@ pub fn gain_accuracy(model: &TypistModel, family: Family, seed: u64, warmup_batc
         brain.learn();
     }
     let table = brain.refresh(&layout, &pool, now);
-    let texts = eval_texts(&pool, &layout);
-    let mut truth: HashMap<(Motor, Motor), f64> = HashMap::new();
-    let mut n = 0usize;
-    for t in &texts {
-        let chars: Vec<char> = t.chars().collect();
-        for i in 0..chars.len() {
-            let prev = if i == 0 { Some(' ') } else { Some(chars[i - 1]) };
-            let (Some(key), Some(a), Some(b)) = (
-                pair_key(&layout, prev, chars[i]),
-                typist.expected_ms_with_extra(prev, chars[i], now, 0.0),
-                typist.expected_ms_with_extra(prev, chars[i], now, 4.0),
-            ) else { continue };
-            *truth.entry(key).or_default() += (a - b) as f64;
-            n += 1;
-        }
-    }
+    let truth = true_gains(&typist, &layout, &pool, now).gain;
     let keys: Vec<(Motor, Motor)> = truth.keys().copied().collect();
-    let t: Vec<f64> = keys.iter().map(|k| truth[k] / n as f64).collect();
+    let t: Vec<f64> = keys.iter().map(|k| truth[k] as f64).collect();
     let m: Vec<f64> = keys.iter().map(|k| *table.gain.get(k).unwrap_or(&0.0) as f64).collect();
     let top = |v: &[f64]| {
         let mut idx: Vec<usize> = (0..v.len()).collect();
@@ -321,4 +318,28 @@ fn spearman(a: &[f64], b: &[f64]) -> f64 {
     let va: f64 = ra.iter().map(|x| (x - ma).powi(2)).sum();
     let vb: f64 = rb.iter().map(|y| (y - mb).powi(2)).sum();
     cov / (va.sqrt() * vb.sqrt()).max(1e-12)
+}
+
+/// The simulator's true gain table (what a perfect typist model would predict).
+pub fn true_gains(typist: &SimTypist, layout: &Layout, pool: &Pool, now: i64) -> GainTable {
+    let texts = eval_texts(pool, layout);
+    let mut table = GainTable::default();
+    let mut n = 0usize;
+    for t in &texts {
+        let chars: Vec<char> = t.chars().collect();
+        for i in 0..chars.len() {
+            let prev = if i == 0 { Some(' ') } else { Some(chars[i - 1]) };
+            let (Some(key), Some(a), Some(b)) = (
+                pair_key(layout, prev, chars[i]),
+                typist.expected_ms_with_extra(prev, chars[i], now, 0.0),
+                typist.expected_ms_with_extra(prev, chars[i], now, 4.0),
+            ) else { continue };
+            *table.gain.entry(key).or_default() += a - b;
+            n += 1;
+        }
+    }
+    for g in table.gain.values_mut() {
+        *g /= n.max(1) as f32;
+    }
+    table
 }

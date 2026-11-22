@@ -14,13 +14,13 @@ use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 
 /// Extra repetitions assumed when asking "what if this pair were practised more?".
-const PRACTICE_REPS: f32 = 4.0;
+const PRACTICE_REPS: f32 = 12.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct GainTable {
     /// Expected ms saved per keystroke of normal text, per practised movement pair.
     pub gain: HashMap<(Motor, Motor), f32>,
-    /// Model uncertainty (ms) per pair, for exploration.
+    /// Model uncertainty per pair, weighted by frequency like `gain` (ms per keystroke).
     pub uncertainty: HashMap<(Motor, Motor), f32>,
     /// Predicted real speed on normal text (WPM).
     pub real_wpm: f64,
@@ -42,12 +42,11 @@ pub fn eval_texts(pool: &Pool, layout: &Layout) -> Vec<String> {
         let sentences = Corpus::get().sentences(*lang);
         let mut picked = 0;
         while picked < 90 / pool.languages.len() {
-            if let Some(s) = sentences.choose(&mut rng) {
-                if layout.can_type(s) && s.chars().count() < 90 {
+            if let Some(s) = sentences.choose(&mut rng)
+                && layout.can_type(s) && s.chars().count() < 90 {
                     texts.push(format!("{s} "));
                     picked += 1;
                 }
-            }
         }
         for _ in 0..6 {
             let line = real_world_line(*lang, &mut rng);
@@ -120,8 +119,7 @@ pub fn compute_gains(model: &TypistModel, history: &PracticeHistory, layout: &La
             if !c.is_alphabetic() && c != ' ' {
                 symbol_gain += gain;
             }
-            let u = table.uncertainty.entry(key).or_default();
-            *u = u.max(a.cost_sd);
+            *table.uncertainty.entry(key).or_default() += a.cost_sd;
             if let Some(stroke) = layout.main_stroke(c) {
                 let e = key_sum.entry(stroke.key).or_default();
                 e.0 += a.cost_ms;
@@ -137,7 +135,7 @@ pub fn compute_gains(model: &TypistModel, history: &PracticeHistory, layout: &La
     if n == 0 {
         return table;
     }
-    for g in table.gain.values_mut() {
+    for g in table.gain.values_mut().chain(table.uncertainty.values_mut()) {
         *g /= n as f32;
     }
     table.real_wpm = 12_000.0 / (total_cost / n as f64);

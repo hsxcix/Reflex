@@ -92,15 +92,20 @@ def build_words(lang: str, sentences: list[str], names: set[str]) -> list[tuple[
     return words
 
 
-def build_sentences(lang: str, sentences: list[str]) -> list[str]:
+def build_sentences(lang: str, sentences: list[str], names: set[str]) -> list[str]:
     block = BLOCKLIST[lang]
     token = re.compile(r"[^\W\d_]+")
+    allowed_caps = {"I", "I'm", "I'll", "I've", "I'd"}
     picked = []
     seen = set()
     for s in sentences:
         if not (18 <= len(s) <= 90) or not SENTENCE_OK.match(s) or s in seen:
             continue
-        if any(t.lower() in block for t in token.findall(s)):
+        tokens = token.findall(s)
+        if any(t.lower() in block for t in tokens):
+            continue
+        # Tatoeba is full of the same few names (Tom, Mary, Ziri...): skip sentences with names.
+        if any(t[0].isupper() and t.lower() in names and t not in allowed_caps for t in tokens):
             continue
         seen.add(s)
         picked.append(s)
@@ -119,7 +124,7 @@ def main() -> None:
     for lang, lang3 in (("de", "deu"), ("en", "eng")):
         sentences = load_sentences(lang3)
         words = build_words(lang, sentences, names)
-        picked = build_sentences(lang, sentences)
+        picked = build_sentences(lang, sentences, names)
         write_zst(OUT / f"{lang}_words.tsv.zst", "".join(f"{w}\t{c}\n" for w, c in words))
         write_zst(OUT / f"{lang}_sentences.txt.zst", "".join(s + "\n" for s in picked))
         print(f"{lang}: {len(words)} words, {len(picked)} sentences; sample: {[w for w, _ in words[200:212]]}")

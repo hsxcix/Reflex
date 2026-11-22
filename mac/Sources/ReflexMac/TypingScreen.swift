@@ -2,12 +2,11 @@ import SwiftUI
 
 struct TypingScreen: View {
     @Environment(AppModel.self) private var model
-    @StateObject private var hover = Local(false)
 
     var body: some View {
         VStack(spacing: 0) {
             TopBar()
-                .opacity(model.isTyping && !hover.value ? 0.12 : 1)
+                .opacity(model.isTyping && !model.mouseActive ? 0.12 : 1)
                 .animation(.easeInOut(duration: 0.35), value: model.isTyping)
                 .padding(.top, 34)
             Spacer(minLength: 20)
@@ -22,9 +21,8 @@ struct TypingScreen: View {
             .padding(.bottom, 26)
         }
         .background(KeyCaptureView(onKey: model.handle, onEscape: model.showStats))
-        .onHover { hover.value = $0 }
         .onContinuousHover { phase in
-            if case .active = phase { hover.value = true }
+            if case .active = phase { model.mouseMoved() }
         }
         .overlay {
             if let error = model.startupError {
