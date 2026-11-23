@@ -22,3 +22,15 @@ Decisions made during the autonomous build (newest last), with reasons.
   - Training: ML +3.94 WPM vs +3.50 for random text and for the weakest-keys heuristic; ML ahead for every simulated person. Keystrokes saved vs random text: 23–28% across runs (target was ≥30%, **not reached yet**). Oracle upper bound: 48–52%.
   - The remaining gap is in the gain estimates, not the planner or bandit (fixed-arm and bandit runs are within noise). Next lever: a model head trained directly on future improvement after practice.
 - **22.11.2026 · Not done in v1:** RL challenger policy (the neural bandit is the learned policy layer for now), layout-switch transfer benchmark, Linux test run (no Docker on this Mac; the core has no OS-specific code).
+- **23.11.2026 · Adopted Keyglide's good parts** (Keyglide was a parallel prototype of the same plan; Reflex won on trainer quality, Keyglide was ahead on app polish):
+  - **Held-out reference sentences** (~4%, stable FNV hash of the text) only measure real speed and are never served as practice, so the trainer can't practise the exact text it is measured on. Effect is small today (model and simulator work per movement pair), but it keeps the measurement clean once anything text-specific is learned.
+  - **Days follow local time** (UTC offset passed in from the app, updated on time-zone/DST/day change); streak, minutes today and day points used to roll over at 01:00/02:00 in Germany.
+  - **Keys are saved while typing** (`open_keys`), moved into `keys` when the line finishes; leftovers after a quit become `abandoned_keys`: exported, never used for training or stats. Schema v2.
+  - **Export:** CSV (one row per key event, archive included) and JSON (same keystroke rows + lines + batches), written to a temp file and renamed, off the main thread, errors shown. The old JSON export had no raw keys at all.
+  - **Heatmap toggle** errors / speed (measured, first attempts, active layout, last 30 days) / predicted (model). The predicted view stays, labelled as such.
+  - **App smoke test** (`--smoke-test`, `tools/smoke.sh`, `./build.sh --smoke`), Reduce Motion (no shake/slide), VoiceOver labels, hint caption with modifier and finger, minimum macOS 26 as planned.
+- **23.11.2026 · Review follow-ups (ROADMAP.md).**
+  - **One instance per data folder** (exclusive `reflex.lock`) instead of tracking open keys per instance: simpler, and it also rules out any other two-writer mix-ups.
+  - **Layout switch mid-line drops the line**: keys typed so far become abandoned with their own layout, and new lines are planned for the new layout. Splitting one line across two layouts would make its per-character records meaningless for the model.
+  - **Export status column** `finished | open | abandoned`; the line being typed is exported as `open`.
+  - **Each batch stores its UTC offset** (schema v3), so a session just after midnight keeps its calendar day across DST changes. Older rows fall back to the current offset.

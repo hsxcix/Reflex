@@ -8,6 +8,7 @@ struct TypingScreen: View {
             TopBar()
                 .opacity(model.isTyping && !model.mouseActive ? 0.12 : 1)
                 .animation(.easeInOut(duration: 0.35), value: model.isTyping)
+                .accessibilityElement(children: .contain)
                 .padding(.top, 34)
             Spacer(minLength: 20)
             TextStage()
@@ -36,6 +37,7 @@ struct TypingScreen: View {
 /// The three visible lines with caret, typed/untyped colouring and error marks.
 struct TextStage: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var shake = Local<CGFloat>(0)
 
     var body: some View {
@@ -54,21 +56,37 @@ struct TextStage: View {
                                 Caret(size: size)
                                     .offset(x: CGFloat(model.view.cursor) * charWidth + shake.value,
                                             y: lineHeight * 0.5 + size * 0.62)
-                                    .animation(.easeOut(duration: 0.07), value: model.view.cursor)
+                                    .animation(reduceMotion ? nil : .easeOut(duration: 0.07), value: model.view.cursor)
                             }
                         }
                 }
             }
             .id(model.lineToken)
-            .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity))
+            .transition(reduceMotion ? .opacity
+                        : .asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity))
             .animation(.easeOut(duration: 0.18), value: model.lineToken)
             .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
         }
         .frame(height: 170)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Text to type")
+        .accessibilityValue(accessibleLine)
         .onChange(of: model.errorToken) {
+            // Reduce Motion: the red mark on the character is the error signal, no shake.
+            guard !reduceMotion else { return }
             withAnimation(.spring(response: 0.12, dampingFraction: 0.25)) { shake.value = 3 }
             withAnimation(.spring(response: 0.2, dampingFraction: 0.5).delay(0.08)) { shake.value = 0 }
         }
+    }
+}
+
+extension TextStage {
+    /// The rest of the current line from the cursor, for VoiceOver.
+    private var accessibleLine: String {
+        guard let line = model.view.lines.first else { return "" }
+        let rest = String(line.dropFirst(Int(model.view.cursor)))
+        let hasError = model.view.errorPositions.contains(model.view.cursor)
+        return (hasError ? "Wrong key. " : "") + "Next: " + rest
     }
 }
 
@@ -115,6 +133,7 @@ struct Caret: View {
 /// Quiet one-line summary after each ~45 s batch.
 struct BatchLine: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var visible = Local(false)
 
     var body: some View {
@@ -131,7 +150,8 @@ struct BatchLine: View {
                 }
                 .font(Theme.mono(14))
                 .foregroundStyle(Theme.muted)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .accessibilityElement(children: .combine)
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .bottom)))
             }
         }
         .frame(maxHeight: .infinity, alignment: .bottom)

@@ -122,7 +122,20 @@ pub struct Word {
 
 pub struct Corpus {
     words: [Vec<Word>; 2],
+    /// Sentences the trainer may serve as practice.
     sentences: [Vec<String>; 2],
+    /// Held-out sentences that only measure real speed (never practised).
+    reference: [Vec<String>; 2],
+}
+
+/// Roughly one sentence in [`REFERENCE_EVERY`] is held out for measuring real speed,
+/// chosen by a stable hash of its text so the split never changes between runs.
+const REFERENCE_EVERY: u64 = 25;
+
+fn is_reference(sentence: &str) -> bool {
+    // FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
+    let hash = sentence.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    hash % REFERENCE_EVERY == 0
 }
 
 impl Corpus {
@@ -142,16 +155,18 @@ impl Corpus {
             let total: f64 = raw.iter().map(|(_, c)| c).sum();
             raw.into_iter().map(|(text, c)| Word { text, freq: c / total }).collect()
         };
-        let sentences = |bytes: &[u8]| decompress(bytes).lines().map(str::to_string).collect();
+        let split = |bytes: &[u8]| -> (Vec<String>, Vec<String>) {
+            decompress(bytes).lines().map(str::to_string).partition(|s| !is_reference(s))
+        };
+        let (de, de_ref) = split(include_bytes!("../../../data/content/de_sentences.txt.zst"));
+        let (en, en_ref) = split(include_bytes!("../../../data/content/en_sentences.txt.zst"));
         Corpus {
             words: [
                 words(include_bytes!("../../../data/content/de_words.tsv.zst")),
                 words(include_bytes!("../../../data/content/en_words.tsv.zst")),
             ],
-            sentences: [
-                sentences(include_bytes!("../../../data/content/de_sentences.txt.zst")),
-                sentences(include_bytes!("../../../data/content/en_sentences.txt.zst")),
-            ],
+            sentences: [de, en],
+            reference: [de_ref, en_ref],
         }
     }
 
@@ -160,8 +175,14 @@ impl Corpus {
         &all[..vocabulary.size().min(all.len())]
     }
 
+    /// Practice sentences (the held-out reference set is excluded).
     pub fn sentences(&self, lang: Lang) -> &[String] {
         &self.sentences[lang.index()]
+    }
+
+    /// Held-out sentences for measuring real speed; never served as practice.
+    pub fn reference_sentences(&self, lang: Lang) -> &[String] {
+        &self.reference[lang.index()]
     }
 }
 
@@ -184,5 +205,16 @@ mod tests {
         assert!(c.sentences(Lang::En).len() > 10_000);
         let total: f64 = c.words(Lang::En, Vocabulary::Full).iter().map(|w| w.freq).sum();
         assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reference_sentences_are_held_out() {
+        let c = Corpus::get();
+        for lang in Lang::ALL {
+            let reference = c.reference_sentences(lang);
+            assert!(reference.len() > 300, "{lang:?}: {}", reference.len());
+            let practice: std::collections::HashSet<&String> = c.sentences(lang).iter().collect();
+            assert!(reference.iter().all(|s| !practice.contains(s)));
+        }
     }
 }

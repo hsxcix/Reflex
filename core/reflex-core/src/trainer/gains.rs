@@ -35,11 +35,13 @@ pub struct GainTable {
 }
 
 /// A fixed sample of normal text for the active pool: what "real speed" means.
+/// Sentences come from the held-out reference set, so the trainer never practises the
+/// exact text it is measured on.
 pub fn eval_texts(pool: &Pool, layout: &Layout) -> Vec<String> {
     let mut rng = StdRng::seed_from_u64(42);
     let mut texts = Vec::new();
     for lang in &pool.languages {
-        let sentences = Corpus::get().sentences(*lang);
+        let sentences = Corpus::get().reference_sentences(*lang);
         let mut picked = 0;
         while picked < 90 / pool.languages.len() {
             if let Some(s) = sentences.choose(&mut rng)

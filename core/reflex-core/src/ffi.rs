@@ -93,7 +93,7 @@ pub struct KeyHint {
 
 #[derive(uniffi::Record)]
 pub struct DayPoint {
-    /// Start of the day (ms since epoch, UTC).
+    /// Local midnight starting the day, in the current time zone (ms since epoch).
     pub day_ms: i64,
     pub wpm: f64,
     pub accuracy: f64,
@@ -116,6 +116,18 @@ pub struct KeyHeat {
     pub ms: f64,
 }
 
+/// Measured numbers for one key of the active layout (first attempts, last 30 days).
+#[derive(uniffi::Record)]
+pub struct KeyMeasured {
+    pub code: String,
+    pub attempts: u32,
+    pub errors: u32,
+    /// errors / attempts.
+    pub error_rate: f64,
+    /// Mean time to a correct press (ms); `None` without timed presses.
+    pub mean_ms: Option<f64>,
+}
+
 #[derive(uniffi::Record)]
 pub struct PairStat {
     pub text: String,
@@ -133,7 +145,10 @@ pub struct Confusion {
 pub struct Stats {
     pub days: Vec<DayPoint>,
     pub forecast: Vec<ForecastPoint>,
+    /// Model-predicted cost per key.
     pub key_heat: Vec<KeyHeat>,
+    /// Measured speed and errors per key.
+    pub key_measured: Vec<KeyMeasured>,
     pub slow_pairs: Vec<PairStat>,
     pub confusions: Vec<Confusion>,
     pub real_wpm: Option<f64>,
@@ -161,19 +176,25 @@ impl ReflexEngine {
 impl ReflexEngine {
     /// Open (or create) Reflex's data in `data_dir`.
     /// `resources_dir` holds the shipped model weights (the app bundle's Resources).
+    /// `utc_offset_min`: local time zone offset, so days end at local midnight.
     #[uniffi::constructor]
-    pub fn open(data_dir: String, resources_dir: String) -> Result<Arc<ReflexEngine>, ReflexError> {
-        let engine = Engine::open(Path::new(&data_dir), Path::new(&resources_dir))?;
+    pub fn open(data_dir: String, resources_dir: String, utc_offset_min: i32) -> Result<Arc<ReflexEngine>, ReflexError> {
+        let engine = Engine::open(Path::new(&data_dir), Path::new(&resources_dir), utc_offset_min)?;
         Ok(Arc::new(ReflexEngine { engine: Mutex::new(engine) }))
     }
 
+    /// The time zone changed (daylight saving time, travel).
+    pub fn set_utc_offset(&self, utc_offset_min: i32) -> Result<(), ReflexError> {
+        Ok(self.lock().set_utc_offset(utc_offset_min)?)
+    }
+
     /// Tell the core which layout ("de-iso", "us-ansi", "eurkey") and hardware ("iso"/"ansi") is active.
-    pub fn set_layout(&self, layout: String, geometry: String) {
+    pub fn set_layout(&self, layout: String, geometry: String) -> Result<(), ReflexError> {
         let id = LayoutId::parse(&layout).unwrap_or(LayoutId::DeIso);
         let geometry = Geometry::parse(&geometry).unwrap_or(Geometry::Iso);
         // German needs the ISO-only key; on ANSI hardware use the closest full layout.
         let id = if id == LayoutId::DeIso && geometry == Geometry::Ansi { LayoutId::UsAnsi } else { id };
-        self.lock().set_layout(id, geometry);
+        Ok(self.lock().set_layout(id, geometry)?)
     }
 
     pub fn key_event(&self, event: KeyEvent) -> Result<KeyResult, ReflexError> {
@@ -287,12 +308,16 @@ impl ReflexEngine {
         let confusions = engine.store().confusions(8)?;
         let total_keystrokes = engine.store().total_chars()?;
         let today_minutes = engine.today_minutes();
+        let offset = engine.utc_offset_min();
         let layout = engine.layout().clone();
+        let char_stats = engine.store().char_stats(layout.id, layout.geometry)?;
         let insights = engine.insights();
         let gains = insights.gains.clone();
         let mut days: Vec<DayPoint> = Vec::new();
         for b in &batches {
-            let day_ms = b.ended_ms / 86_400_000 * 86_400_000;
+            // Each batch keeps the calendar day it was typed on; the point sits at that
+            // day's midnight in the current zone, so the chart shows the right date.
+            let day_ms = crate::stats::day_start_ms(b.local_day(offset), offset);
             match days.last_mut() {
                 Some(d) if d.day_ms == day_ms => {
                     let w = d.minutes / (d.minutes + b.seconds / 60.0);
@@ -315,6 +340,16 @@ impl ReflexEngine {
                 })
                 .collect()
         });
+        let key_measured = crate::stats::key_measured(&char_stats, &layout)
+            .into_iter()
+            .map(|m| KeyMeasured {
+                code: KEY_CODES[m.key as usize].to_string(),
+                attempts: m.attempts,
+                errors: m.errors,
+                error_rate: m.error_rate,
+                mean_ms: m.mean_ms,
+            })
+            .collect();
         let label = |k: u8| layout.label(k, Layer::Base).filter(|l| !l.is_empty()).unwrap_or_else(|| KEY_CODES[k as usize].to_string());
         Ok(Stats {
             forecast: insights
@@ -322,6 +357,7 @@ impl ReflexEngine {
                 .as_ref()
                 .map_or_else(Vec::new, |f| f.points.iter().map(|(d, w, pm)| ForecastPoint { days: *d, wpm: *w, plus_minus: *pm }).collect()),
             key_heat,
+            key_measured,
             slow_pairs: gains.as_ref().map_or_else(Vec::new, |g| {
                 g.slow_pairs.iter().map(|(t, ms)| PairStat { text: t.clone(), ms: *ms as f64 }).collect()
             }),
@@ -332,7 +368,7 @@ impl ReflexEngine {
             real_wpm: gains.as_ref().map(|g| g.real_wpm).filter(|w| *w > 0.0),
             confidence: gains.as_ref().map_or(0.0, |g| (1.0 - 4.0 * g.uncertainty_ratio as f64).clamp(0.0, 1.0)),
             model_ready: insights.model_ready,
-            streak_days: crate::stats::streak_days(&batches, engine::now_ms()),
+            streak_days: crate::stats::streak_days(&batches, engine::now_ms(), offset),
             total_minutes: batches.iter().map(|b| b.seconds).sum::<f64>() / 60.0,
             today_minutes,
             total_keystrokes,
@@ -340,9 +376,27 @@ impl ReflexEngine {
         })
     }
 
-    /// Write all data as JSON to `path`.
-    pub fn export(&self, path: String) -> Result<(), ReflexError> {
+    /// Write everything as JSON to `path` (keystrokes, lines, batches; archive included).
+    pub fn export_json(&self, path: String) -> Result<(), ReflexError> {
         let json = self.lock().store().export_json()?;
-        std::fs::write(path, json).map_err(|e| ReflexError::Storage(e.to_string()))
+        write_atomic(&path, json.as_bytes())
     }
+
+    /// Write every keystroke as one CSV row to `path` (archive included).
+    pub fn export_csv(&self, path: String) -> Result<(), ReflexError> {
+        let csv = self.lock().store().export_csv()?;
+        write_atomic(&path, csv.as_bytes())
+    }
+}
+
+/// Write to a temporary file next to `path`, then rename: never leaves a half-written export.
+fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), ReflexError> {
+    let target = Path::new(path);
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    let tmp = target.with_file_name(format!(".{name}.reflex-tmp"));
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, target));
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result.map_err(|e| ReflexError::Storage(format!("could not write {path}: {e}")))
 }

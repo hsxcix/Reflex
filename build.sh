@@ -2,7 +2,18 @@
 # Build Reflex: Rust core → Swift bindings → SwiftUI app bundle in ./build and ~/Applications.
 #   ./build.sh            build + install + launch in the background
 #   ./build.sh --no-open  build + install only
+#   ./build.sh --smoke    build + install, then run the automated app check (tools/smoke.sh)
+# Environment: REFLEX_INSTALL_DIR (default ~/Applications), CARGO_HOME (e.g. an offline cache).
 set -euo pipefail
+OPEN=1 SMOKE=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-open) OPEN=0 ;;
+    --smoke) OPEN=0 SMOKE=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+INSTALL_DIR="${REFLEX_INSTALL_DIR:-$HOME/Applications}"
 cd "${0:A:h}"
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
@@ -49,17 +60,20 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-  <key>LSMinimumSystemVersion</key><string>15.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.education</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict></plist>
 PLIST
 codesign --force --sign - "$APP" >/dev/null
+codesign --verify --strict "$APP"
 
 pkill -x Reflex 2>/dev/null || true
-mkdir -p ~/Applications
-rm -rf ~/Applications/Reflex.app
-cp -R "$APP" ~/Applications/
-echo "› installed ~/Applications/Reflex.app"
-[[ "${1:-}" == "--no-open" ]] || open -g ~/Applications/Reflex.app
+mkdir -p "$INSTALL_DIR"
+rm -rf "$INSTALL_DIR/Reflex.app"
+cp -R "$APP" "$INSTALL_DIR/"
+echo "› installed $INSTALL_DIR/Reflex.app"
+(( SMOKE )) && tools/smoke.sh "$INSTALL_DIR/Reflex.app"
+(( OPEN )) && open -g "$INSTALL_DIR/Reflex.app"
+exit 0

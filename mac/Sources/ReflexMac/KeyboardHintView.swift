@@ -7,10 +7,28 @@ struct KeyboardHintView: View {
 
     var body: some View {
         let hint = model.hint
-        KeyboardDrawing(caps: model.keyboard, highlight: hint)
-            .opacity(hint == nil ? 0 : 1)
-            .animation(.easeInOut(duration: hint == nil ? 0.15 : 0.35), value: hint == nil)
-            .allowsHitTesting(false)
+        VStack(spacing: 6) {
+            KeyboardDrawing(caps: model.keyboard, highlight: hint)
+                .accessibilityHidden(true)
+            Text(hint.map(describe) ?? " ")
+                .font(Theme.mono(12))
+                .foregroundStyle(Theme.muted)
+        }
+        .opacity(hint == nil ? 0 : 1)
+        .animation(.easeInOut(duration: hint == nil ? 0.15 : 0.35), value: hint == nil)
+        .allowsHitTesting(false)
+        .accessibilityHidden(hint == nil)
+    }
+
+    /// "⇧ shift + A · left pinky": the hint in words, not only in colour.
+    private func describe(_ hint: KeyHint) -> String {
+        let main = hint.codes.last.flatMap { code in model.keyboard.first { $0.code == code } }
+        let label = main.map { $0.code == "Space" ? "space" : $0.label.uppercased() } ?? "?"
+        var parts: [String] = []
+        if hint.option { parts.append("⌥ option") }
+        if hint.shift { parts.append("⇧ shift") }
+        parts.append(label)
+        return parts.joined(separator: " + ") + " · " + Theme.fingerName(Int(hint.finger))
     }
 }
 
@@ -18,6 +36,8 @@ struct KeyboardDrawing: View {
     let caps: [KeyCap]
     let highlight: KeyHint?
     var heat: [String: Double] = [:]
+    /// Per-key text for the tooltip and VoiceOver (e.g. "20% errors · 10 tries").
+    var details: [String: String] = [:]
 
     var body: some View {
         GeometryReader { geo in
@@ -37,6 +57,17 @@ struct KeyboardDrawing: View {
     }
 
     private func capView(_ cap: KeyCap, unit: CGFloat) -> some View {
+        let name = capName(cap)
+        let detail: String? = details[cap.code]
+        let tooltip: String = detail.map { name + ": " + $0 } ?? ""
+        return capShape(cap, unit: unit)
+            .help(tooltip)
+            .accessibilityElement()
+            .accessibilityLabel(name)
+            .accessibilityValue(detail ?? "no data")
+    }
+
+    private func capShape(_ cap: KeyCap, unit: CGFloat) -> some View {
         let isTarget = highlight?.codes.contains(cap.code) == true
         let finger = Theme.fingers[Int(cap.finger) % Theme.fingers.count]
         let heatValue = heat[cap.code]
@@ -52,6 +83,10 @@ struct KeyboardDrawing: View {
                     .foregroundStyle(isTarget ? Theme.text : Theme.muted.opacity(0.7))
             )
             .frame(width: CGFloat(cap.width) * unit - unit * 0.1, height: unit * 0.92)
+    }
+
+    private func capName(_ cap: KeyCap) -> String {
+        cap.code == "Space" ? "space" : cap.label.uppercased()
     }
 
     private func fill(isTarget: Bool, finger: Color, heat: Double?) -> Color {

@@ -1,5 +1,10 @@
 Copyright (c) 2026 hsxcix. All rights reserved.
 
+Scope: this notice covers everything in this repository except the bundled text
+data in core/data/content (word lists and sentences). Those files are
+third-party material under their own licenses (CC BY-SA 4.0 and CC BY 2.0 FR),
+listed in CREDITS.md; those licenses apply to them instead of this notice.
+
 No license is granted. You may not use, copy, modify, merge, publish,
 distribute, sublicense or sell this software or any part of it without the
 author's prior written permission.

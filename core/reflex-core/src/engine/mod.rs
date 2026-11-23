@@ -9,7 +9,7 @@ use crate::content::Pool;
 use crate::layout::{Geometry, Layout, LayoutId};
 use crate::record::TypedLine;
 use crate::session::{BatchTotals, KeyInput, KeyOutcome, TypingSession};
-use crate::store::{BatchRecord, Store, StoreError};
+use crate::store::{BatchRecord, OpenLine, Store, StoreError};
 use crate::trainer::bandit::Trial;
 use crate::trainer::gains::GainTable;
 use crate::trainer::lines::RecentWords;
@@ -72,18 +72,32 @@ pub struct Engine {
     rng: StdRng,
     batch_lines: Vec<TypedLine>,
     recent_wpms: VecDeque<f64>,
+    /// Active seconds on local day `today`.
     today_sec: f64,
+    today: i64,
+    utc_offset_min: i32,
     jobs: Sender<Job>,
     updates: Receiver<Update>,
     insights: Insights,
     pending_real_wpm: bool,
+    /// Exclusive lock on the data folder for as long as the engine lives: a second
+    /// instance on the same data would mix up open keys.
+    _lock: std::fs::File,
 }
 
 impl Engine {
     /// Open the data in `data_dir`; `resources_dir` holds the shipped pretrained model.
-    pub fn open(data_dir: &Path, resources_dir: &Path) -> Result<Engine, StoreError> {
-        std::fs::create_dir_all(data_dir).ok();
+    /// `utc_offset_min` is the local time zone offset; days (streak, minutes today) follow it.
+    pub fn open(data_dir: &Path, resources_dir: &Path, utc_offset_min: i32) -> Result<Engine, StoreError> {
+        std::fs::create_dir_all(data_dir)?;
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(data_dir.join("reflex.lock"))?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => StoreError::Locked,
+            std::fs::TryLockError::Error(e) => StoreError::Io(e),
+        })?;
         let mut store = Store::open(&data_dir.join("reflex.sqlite"))?;
+        // Keys of a line left open by the last run (quit or crash mid-line).
+        store.abandon_open_keys()?;
         store.archive_old_sessions(now_ms())?;
         let pool = store.setting("pool")?.and_then(|s| crate::settings::parse_pool(&s)).unwrap_or_default();
         let trials: Vec<Trial> = store
@@ -92,7 +106,8 @@ impl Engine {
             .unwrap_or_default();
         let batches = store.batches()?;
         let recent_wpms = batches.iter().rev().take(10).map(|b| b.wpm).collect();
-        let today_sec = today_seconds(&batches);
+        let today = crate::stats::day_index(now_ms(), utc_offset_min);
+        let today_sec = day_seconds(&batches, today, utc_offset_min);
         let layout = Layout::new(LayoutId::DeIso, Geometry::Iso);
         let personal = data_dir.join(format!("models/typist-v{}.bpk", crate::model::MODEL_VERSION));
         let (jobs, updates) = worker::spawn(WorkerSetup {
@@ -118,10 +133,13 @@ impl Engine {
             batch_lines: Vec::new(),
             recent_wpms,
             today_sec,
+            today,
+            utc_offset_min,
             jobs,
             updates,
             insights: Insights::default(),
             pending_real_wpm: false,
+            _lock: lock,
         };
         engine.fill_queue();
         Ok(engine)
@@ -139,21 +157,49 @@ impl Engine {
         &self.pool
     }
 
+    pub fn utc_offset_min(&self) -> i32 {
+        self.utc_offset_min
+    }
+
+    /// The time zone changed (travel, daylight saving time).
+    pub fn set_utc_offset(&mut self, utc_offset_min: i32) -> Result<(), StoreError> {
+        if utc_offset_min != self.utc_offset_min {
+            self.utc_offset_min = utc_offset_min;
+            self.today = crate::stats::day_index(now_ms(), utc_offset_min);
+            self.today_sec = day_seconds(&self.store.batches()?, self.today, utc_offset_min);
+        }
+        Ok(())
+    }
+
+    /// Start counting from zero once local midnight has passed.
+    fn roll_day(&mut self) {
+        let today = crate::stats::day_index(now_ms(), self.utc_offset_min);
+        if today != self.today {
+            self.today = today;
+            self.today_sec = 0.0;
+        }
+    }
+
     pub fn insights(&mut self) -> &Insights {
         self.poll();
         &self.insights
     }
 
-    pub fn set_layout(&mut self, id: LayoutId, geometry: Geometry) {
+    /// Switch layout. A line in progress is dropped: its keys were typed on the old layout,
+    /// stay in the export as abandoned (with that layout) and never count for the new one.
+    pub fn set_layout(&mut self, id: LayoutId, geometry: Geometry) -> Result<(), StoreError> {
         if self.layout.id == id && self.layout.geometry == geometry {
-            return;
+            return Ok(());
+        }
+        if self.session.drop_all_lines() {
+            self.store.abandon_open_keys()?;
         }
         self.layout = Layout::new(id, geometry);
         self.session.set_layout(id, geometry);
         self.session_id = None;
-        self.session.clear_upcoming();
         self.fill_queue();
         self.send_context();
+        Ok(())
     }
 
     pub fn set_pool(&mut self, pool: Pool) -> Result<(), StoreError> {
@@ -180,16 +226,23 @@ impl Engine {
     /// Handle a key. Returns the outcome and a summary if this key closed a batch.
     pub fn key(&mut self, input: KeyInput) -> Result<(KeyOutcome, Option<BatchSummary>), StoreError> {
         self.poll();
+        let open_line = self.session.lines().next().map(|l| OpenLine {
+            text: l.text.clone(),
+            kind: l.kind,
+            lang: l.lang,
+            layout: self.layout.id,
+            geometry: self.layout.geometry,
+        });
+        let keys_before = self.session.open_keys().len();
         let (outcome, finished) = self.session.key(&input);
+        if finished.is_none()
+            && self.session.open_keys().len() > keys_before
+            && let (Some(line), Some(key)) = (open_line, self.session.open_keys().last().cloned()) {
+                let session_id = self.ensure_session()?;
+                self.store.insert_open_key(Some(session_id), &line, &key)?;
+            }
         if let Some(f) = finished {
-            let session_id = match self.session_id {
-                Some(id) => id,
-                None => {
-                    let id = self.store.begin_session(self.layout.id, self.layout.geometry, now_ms())?;
-                    self.session_id = Some(id);
-                    id
-                }
-            };
+            let session_id = self.ensure_session()?;
             self.store.insert_line(session_id, &f.line, &f.keys)?;
             self.batch_lines.push(f.line);
             self.fill_queue();
@@ -212,6 +265,15 @@ impl Engine {
         Ok((outcome, Some(summary)))
     }
 
+    fn ensure_session(&mut self) -> Result<i64, StoreError> {
+        if let Some(id) = self.session_id {
+            return Ok(id);
+        }
+        let id = self.store.begin_session(self.layout.id, self.layout.geometry, now_ms())?;
+        self.session_id = Some(id);
+        Ok(id)
+    }
+
     fn close_batch(&mut self, totals: BatchTotals) -> Result<BatchSummary, StoreError> {
         let wpm = totals.wpm();
         let avg = if self.recent_wpms.is_empty() {
@@ -222,6 +284,7 @@ impl Engine {
         let fatigue_hint = crate::stats::fatigue(&self.recent_wpms, wpm, self.session.session_sec());
         self.recent_wpms.push_front(wpm);
         self.recent_wpms.truncate(10);
+        self.roll_day();
         self.today_sec += totals.active_sec;
         let real_wpm = self.real_wpm();
         self.store.insert_batch(&BatchRecord {
@@ -234,6 +297,7 @@ impl Engine {
             accuracy: totals.accuracy(),
             real_wpm,
             arm: None,
+            utc_offset_min: Some(self.utc_offset_min),
         })?;
         Ok(BatchSummary { wpm, accuracy: totals.accuracy(), trend: wpm - avg, real_wpm, fatigue_hint })
     }
@@ -269,6 +333,7 @@ impl Engine {
 
     pub fn view(&mut self) -> View {
         self.poll();
+        self.roll_day();
         let totals = self.session.batch();
         View {
             lines: self.session.lines().take(VISIBLE_LINES).map(|l| l.text.clone()).collect(),
@@ -285,7 +350,8 @@ impl Engine {
         self.session.expected()
     }
 
-    pub fn today_minutes(&self) -> f64 {
+    pub fn today_minutes(&mut self) -> f64 {
+        self.roll_day();
         (self.today_sec + self.session.batch().active_sec) / 60.0
     }
 
@@ -303,7 +369,10 @@ impl Engine {
     }
 }
 
-fn today_seconds(batches: &[BatchRecord]) -> f64 {
-    let day = now_ms() / 86_400_000;
-    batches.iter().filter(|b| b.ended_ms / 86_400_000 == day).map(|b| b.seconds).sum()
+fn day_seconds(batches: &[BatchRecord], day: i64, utc_offset_min: i32) -> f64 {
+    batches
+        .iter()
+        .filter(|b| b.local_day(utc_offset_min) == day)
+        .map(|b| b.seconds)
+        .sum()
 }

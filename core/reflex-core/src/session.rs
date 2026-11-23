@@ -127,9 +127,26 @@ impl TypingSession {
         self.lines.push_back(line);
     }
 
+    /// Drop every line, including progress on the current one (layout switched mid-line:
+    /// keys typed so far belong to the old layout). Returns true if progress was dropped.
+    pub fn drop_all_lines(&mut self) -> bool {
+        let had_progress = self.pos > 0 || !self.keys.is_empty();
+        if self.pos > 0 {
+            self.prev_char = self.line_prev_char;
+        }
+        self.lines.clear();
+        self.pos = 0;
+        self.attempt = Attempt::default();
+        self.records.clear();
+        self.keys.clear();
+        self.error_positions.clear();
+        had_progress
+    }
+
     /// Drop queued (not yet started) lines, e.g. after the pool changed.
     pub fn clear_upcoming(&mut self) {
-        let keep = if self.pos > 0 { 1 } else { 0 };
+        // Keep the current line once anything was typed on it (keys already belong to it).
+        let keep = if self.pos > 0 || !self.keys.is_empty() { 1 } else { 0 };
         self.lines.truncate(keep);
     }
 
@@ -159,6 +176,11 @@ impl TypingSession {
 
     pub fn expected(&self) -> Option<char> {
         self.lines.front().and_then(|l| l.text.chars().nth(self.pos))
+    }
+
+    /// Raw keys of the line being typed (moved into [`FinishedLine`] when it completes).
+    pub fn open_keys(&self) -> &[KeyEventRecord] {
+        &self.keys
     }
 
     /// Character before the cursor (for hints and context).

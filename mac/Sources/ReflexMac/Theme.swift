@@ -11,6 +11,12 @@ enum Theme {
     static let chip = Color("chip", light: 0xE6E0D4, dark: 0x22252B)
 
     /// Finger colours for the on-screen keyboard (left pinky … right pinky).
+    static func fingerName(_ index: Int) -> String {
+        let names = ["left pinky", "left ring", "left middle", "left index", "left thumb",
+                     "right thumb", "right index", "right middle", "right ring", "right pinky"]
+        return names.indices.contains(index) ? names[index] : "finger"
+    }
+
     static let fingers: [Color] = [
         Color(hex: 0xE07A5F), Color(hex: 0xE9A23B), Color(hex: 0x8AB17D), Color(hex: 0x4FA3A5), Color(hex: 0x9C9C9C),
         Color(hex: 0x9C9C9C), Color(hex: 0x5B8DEF), Color(hex: 0x9D7BD8), Color(hex: 0xD86FA8), Color(hex: 0xC9675B),

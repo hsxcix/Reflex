@@ -3,8 +3,11 @@ import SwiftUI
 
 /// Progress: real speed over time with forecast, keyboard heatmap, slowest pairs,
 /// typical mistakes. Tab or Esc returns to typing.
+enum HeatMode: String, CaseIterable { case errors, speed, predicted }
+
 struct StatsScreen: View {
     @Environment(AppModel.self) private var model
+    @StateObject private var heatMode = Local(HeatMode.errors)
 
     var body: some View {
         let stats = model.stats
@@ -21,10 +24,20 @@ struct StatsScreen: View {
                         }
                         .frame(width: 250)
                     }
-                    Panel(title: "keyboard · where time goes") {
-                        KeyboardDrawing(caps: model.keyboard, highlight: nil,
-                                        heat: Dictionary(uniqueKeysWithValues: stats.keyHeat.map { ($0.code, $0.value) }))
+                    let heat = KeyHeatMap(stats: stats, mode: heatMode.value)
+                    Panel(title: heat.title) {
+                        Picker("Heatmap", selection: $heatMode.value) {
+                            ForEach(HeatMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 300)
+                        KeyboardDrawing(caps: model.keyboard, highlight: nil, heat: heat.values, details: heat.details)
                             .frame(height: 210)
+                        if heat.values.isEmpty {
+                            Text(heatMode.value == .predicted ? "learning…" : "no data for this layout yet")
+                                .font(Theme.mono(12)).foregroundStyle(Theme.muted)
+                        }
                     }
                 } else {
                     Text("Type a little first; your progress appears here.")
@@ -47,7 +60,7 @@ struct StatsScreen: View {
         HStack(alignment: .firstTextBaseline, spacing: 34) {
             Text("reflex").font(Theme.mono(15, weight: .semibold)).foregroundStyle(Theme.accent)
             Metric(value: stats?.realWpm.map { "\(Int($0.rounded()))" } ?? "–", label: "real wpm",
-                   help: "Predicted speed on normal text, errors included")
+                   help: "Predicted speed on held-out normal text (never practised), errors included")
             Metric(value: stats.map { "\($0.streakDays)" } ?? "0", label: "day streak")
             Metric(value: stats.map { "\(Int($0.todayMinutes.rounded()))" } ?? "0", label: "min today")
             Metric(value: stats.map { formatHours($0.totalMinutes) } ?? "0", label: "practised")
@@ -62,6 +75,37 @@ struct StatsScreen: View {
     }
 }
 
+/// Heat values (0…1) and tooltip text per key for one heatmap mode. Keys without data
+/// are left out and drawn neutral.
+struct KeyHeatMap {
+    let values: [String: Double]
+    let details: [String: String]
+    let title: String
+
+    init(stats: Stats, mode: HeatMode) {
+        switch mode {
+        case .predicted:
+            title = "keyboard · predicted time per key (model)"
+            values = Dictionary(uniqueKeysWithValues: stats.keyHeat.map { ($0.code, $0.value) })
+            details = Dictionary(uniqueKeysWithValues: stats.keyHeat.map { ($0.code, "~\(Int($0.ms)) ms predicted") })
+        case .speed:
+            title = "keyboard · measured time per key, last 30 days"
+            let timed = stats.keyMeasured.compactMap { k in k.meanMs.map { (k, $0) } }
+            let lo = timed.map(\.1).min() ?? 0, hi = timed.map(\.1).max() ?? 0
+            values = Dictionary(uniqueKeysWithValues: timed.map { k, ms in (k.code, hi > lo ? (ms - lo) / (hi - lo) : 0) })
+            details = Dictionary(uniqueKeysWithValues: timed.map { k, ms in (k.code, "\(Int(ms.rounded())) ms · \(k.attempts) tries") })
+        case .errors:
+            title = "keyboard · measured error rate, last 30 days"
+            // Scale to the worst key, but at least 10 %, so a few slips don't glow red.
+            let top = max(stats.keyMeasured.map(\.errorRate).max() ?? 0, 0.1)
+            values = Dictionary(uniqueKeysWithValues: stats.keyMeasured.map { ($0.code, min($0.errorRate / top, 1)) })
+            details = Dictionary(uniqueKeysWithValues: stats.keyMeasured.map {
+                ($0.code, "\(Int(($0.errorRate * 100).rounded()))% errors · \($0.errors) of \($0.attempts) tries")
+            })
+        }
+    }
+}
+
 struct Metric: View {
     let value: String
     let label: String
@@ -73,6 +117,9 @@ struct Metric: View {
             Text(label).font(Theme.mono(11)).foregroundStyle(Theme.muted)
         }
         .help(help ?? label)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(value)
     }
 }
 
