@@ -73,6 +73,8 @@ pkill -x Reflex 2>/dev/null || true
 mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/Reflex.app"
 cp -R "$APP" "$INSTALL_DIR/"
+# Drop the build copy: only the installed app should show up in Spotlight / Launchpad.
+rm -rf "$APP"
 echo "› installed $INSTALL_DIR/Reflex.app"
 (( SMOKE )) && tools/smoke.sh "$INSTALL_DIR/Reflex.app"
 (( OPEN )) && open -g "$INSTALL_DIR/Reflex.app"

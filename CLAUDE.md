@@ -8,7 +8,7 @@ Plan: PLAN.md · decisions log: DECISIONS.md (append with date + reason when dec
 - `core/reflex-cli` — `reflex-cli` for pretraining, simulation, benchmarks (GPU via Burn/wgpu).
 - `core/uniffi-bindgen` — generates Swift bindings.
 - `mac/` — SwiftPM app `ReflexMac` (no Xcode needed). Generated files (`Sources/ReflexMac/Generated`, FFI header/modulemap) are gitignored.
-- `tools/build_content.py` — rebuilds `core/data/content` from raw downloads in `~/Apps/Reflex-data/raw` (`uv run tools/build_content.py ~/Apps/Reflex-data/raw core/data/content`).
+- `tools/build_content.py` — rebuilds `core/data/content` from raw downloads (URLs in its docstring; download into a temp folder, then `uv run tools/build_content.py <raw> core/data/content`). The raw folder `~/Apps/Reflex-data` was deleted 23.11.2026.
 
 ## Build / run
 - `./build.sh` builds core + app, installs `~/Applications/Reflex.app`, launches it with `open -g` (no focus steal). `--no-open` to skip launch, `--smoke` to run the app check instead. Env: `REFLEX_INSTALL_DIR`, `CARGO_HOME`.

@@ -5,6 +5,12 @@
 """Build Reflex's bundled text content from raw downloads.
 
 Inputs (in RAW dir): FrequencyWords {de,en}_50k.txt, Tatoeba {deu,eng}_sentences.tsv.bz2
+  https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/de/de_50k.txt
+  https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/en/en_50k.txt
+  https://downloads.tatoeba.org/exports/per_language/deu/deu_sentences.tsv.bz2
+  https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
+Only needed to rebuild the content; Tatoeba exports change over time, so a rebuild
+gives a different (equally valid) sentence sample.
 Outputs (in core/data/content): {de,en}_words.tsv.zst (word<TAB>count, ranked),
 {de,en}_sentences.txt.zst (one sentence per line).
 """
