@@ -134,8 +134,16 @@ impl TypistModel {
         }
     }
 
-    /// Training loss. `boot` [B, T, E] are bootstrap weights so heads see different data.
+    /// Training loss: prediction loss plus the regulariser on personal weights.
     pub fn loss(&self, b: &Batch, boot: Tensor<3>) -> Tensor<1> {
+        let l2 = self.personal.weight.val().powf_scalar(2.0).mean();
+        self.data_loss(b, boot) + l2 * 50.0
+    }
+
+    /// Prediction loss only (latency NLL, error BCE, confusion CE). `boot` [B, T, E] are
+    /// bootstrap weights so heads see different data. Model selection compares this, not
+    /// the regulariser.
+    pub fn data_loss(&self, b: &Batch, boot: Tensor<3>) -> Tensor<1> {
         let labels = b.labels.as_ref().expect("training batch has labels");
         let out = self.forward(b);
         let y = labels.log_latency.clone().unsqueeze_dim::<3>(2);
@@ -154,8 +162,7 @@ impl TypistModel {
         let picked = logp.gather(2, labels.wrong_key.clone().unsqueeze_dim::<3>(2)).squeeze_dim::<2>(2);
         let ce = (picked * labels.wrong_mask.clone()).sum().neg() / (labels.wrong_mask.clone().sum() + 1.0);
 
-        let l2 = self.personal.weight.val().powf_scalar(2.0).mean();
-        nll + bce * 2.0 + ce * 0.2 + l2 * 50.0
+        nll + bce * 2.0 + ce * 0.2
     }
 }
 

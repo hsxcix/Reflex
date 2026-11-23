@@ -3,7 +3,7 @@
 use crate::layout::{KeyId, Layout};
 use crate::store::{BatchRecord, CharStat};
 use std::collections::HashMap;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -19,12 +19,14 @@ pub fn day_start_ms(day: i64, utc_offset_min: i32) -> i64 {
 
 /// True when the last batches show a clear drop against this session's best after
 /// at least 10 minutes of practice: a good moment for a break.
-pub fn fatigue(recent_wpms: &VecDeque<f64>, current: f64, session_sec: f64) -> bool {
-    if session_sec < 600.0 || recent_wpms.len() < 3 {
+/// `session_wpms` are this session's earlier batches, oldest first.
+pub fn fatigue(session_wpms: &[f64], current: f64, session_sec: f64) -> bool {
+    let n = session_wpms.len();
+    if session_sec < 600.0 || n < 3 {
         return false;
     }
-    let best = recent_wpms.iter().copied().fold(current, f64::max);
-    let last3: f64 = (current + recent_wpms[0] + recent_wpms[1]) / 3.0;
+    let best = session_wpms.iter().copied().fold(current, f64::max);
+    let last3: f64 = (current + session_wpms[n - 1] + session_wpms[n - 2]) / 3.0;
     last3 < best * 0.88
 }
 
@@ -112,6 +114,7 @@ mod tests {
             real_wpm: None,
             arm: None,
             utc_offset_min: None,
+            probe_wpm: None,
         }
     }
 
@@ -152,7 +155,7 @@ mod tests {
 
     #[test]
     fn fatigue_needs_time_and_drop() {
-        let w: VecDeque<f64> = [80.0, 82.0, 90.0, 91.0].into();
+        let w = [91.0, 90.0, 82.0, 80.0];
         assert!(!fatigue(&w, 70.0, 100.0));
         assert!(fatigue(&w, 70.0, 900.0));
         assert!(!fatigue(&w, 88.0, 900.0));

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const ARCHIVE_AFTER_DAYS: i64 = 30;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const KEY_COLUMNS: &str = "session_id, text, kind, lang, layout, geometry, pos, t_us, wall_ms, typed, key, modifiers, correct";
 
@@ -56,6 +56,9 @@ pub struct BatchRecord {
     /// daylight saving changes. `None` for batches stored before schema v3.
     #[serde(default)]
     pub utc_offset_min: Option<i32>,
+    /// Measured real speed of a probe line typed in this batch (schema v4).
+    #[serde(default)]
+    pub probe_wpm: Option<f64>,
 }
 
 impl BatchRecord {
@@ -67,6 +70,7 @@ impl BatchRecord {
 
 pub struct Store {
     conn: Connection,
+    path: Option<std::path::PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,21 +84,43 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let store = Store { conn };
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let store = Store { conn, path: Some(path.to_path_buf()) };
         store.migrate()?;
         Ok(store)
     }
 
+    /// A second, read-only connection to the same database (WAL: reads never block the
+    /// writer). Exports and stats use it, so typing never waits for them.
+    pub fn reader(&self) -> Result<Store> {
+        let Some(path) = &self.path else {
+            return Err(StoreError::Archive("in-memory store has no reader".into()));
+        };
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store { conn, path: Some(path.clone()) })
+    }
+
     pub fn open_in_memory() -> Result<Store> {
-        let store = Store { conn: Connection::open_in_memory()? };
+        let store = Store { conn: Connection::open_in_memory()?, path: None };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Run one migration step and its version bump atomically: a crash mid-way leaves the
+    /// database at the previous version, untouched.
+    fn step(&self, version: i64, sql: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
         let version: i64 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version < 1 {
-            self.conn.execute_batch(
+            self.step(1, 
                 "CREATE TABLE sessions (
                      id INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL,
                      layout TEXT NOT NULL, geometry TEXT NOT NULL);
@@ -129,14 +155,17 @@ impl Store {
                  lang TEXT NOT NULL, layout TEXT NOT NULL, geometry TEXT NOT NULL, pos INTEGER NOT NULL,
                  t_us INTEGER NOT NULL, wall_ms INTEGER NOT NULL, typed TEXT NOT NULL, key INTEGER,
                  modifiers INTEGER NOT NULL, correct INTEGER NOT NULL";
-            self.conn.execute_batch(&format!(
-                "CREATE TABLE open_keys ({columns}); CREATE TABLE abandoned_keys ({columns});"
-            ))?;
+            self.step(2, &format!("CREATE TABLE open_keys ({columns}); CREATE TABLE abandoned_keys ({columns});"))?;
         }
         if version < 3 {
-            self.conn.execute_batch("ALTER TABLE batches ADD COLUMN utc_offset_min INTEGER;")?;
+            self.step(3, "ALTER TABLE batches ADD COLUMN utc_offset_min INTEGER;")?;
         }
-        self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if version < 4 {
+            // Measured real speed (probe lines) per batch; index for per-layout stats.
+            self.step(4, "ALTER TABLE batches ADD COLUMN probe_wpm REAL;
+                          CREATE INDEX IF NOT EXISTS lines_layout ON lines(layout, geometry);")?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 4);
         Ok(())
     }
 
@@ -220,26 +249,28 @@ impl Store {
         Ok(n)
     }
 
-    pub fn insert_batch(&self, b: &BatchRecord) -> Result<()> {
+    /// Store a batch; returns its row id.
+    pub fn insert_batch(&self, b: &BatchRecord) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO batches (session_id, ended_ms, seconds, chars, errors, wpm, accuracy, real_wpm, arm, utc_offset_min)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![b.session_id, b.ended_ms, b.seconds, b.chars, b.errors, b.wpm, b.accuracy, b.real_wpm, b.arm, b.utc_offset_min],
+            "INSERT INTO batches (session_id, ended_ms, seconds, chars, errors, wpm, accuracy, real_wpm, arm, utc_offset_min, probe_wpm)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![b.session_id, b.ended_ms, b.seconds, b.chars, b.errors, b.wpm, b.accuracy, b.real_wpm, b.arm, b.utc_offset_min, b.probe_wpm],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn update_last_batch(&self, real_wpm: f64, arm: Option<u32>) -> Result<()> {
+    /// Attach the learning results to batch `id` (arm it was typed with, estimates).
+    pub fn update_batch(&self, id: i64, real_wpm: Option<f64>, arm: Option<u32>, probe_wpm: Option<f64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE batches SET real_wpm = ?1, arm = ?2 WHERE id = (SELECT MAX(id) FROM batches)",
-            params![real_wpm, arm],
+            "UPDATE batches SET real_wpm = COALESCE(?2, real_wpm), arm = ?3, probe_wpm = COALESCE(?4, probe_wpm) WHERE id = ?1",
+            params![id, real_wpm, arm, probe_wpm],
         )?;
         Ok(())
     }
 
     pub fn batches(&self) -> Result<Vec<BatchRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, ended_ms, seconds, chars, errors, wpm, accuracy, real_wpm, arm, utc_offset_min
+            "SELECT session_id, ended_ms, seconds, chars, errors, wpm, accuracy, real_wpm, arm, utc_offset_min, probe_wpm
              FROM batches ORDER BY ended_ms",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -254,6 +285,7 @@ impl Store {
                 real_wpm: r.get(7)?,
                 arm: r.get(8)?,
                 utc_offset_min: r.get(9)?,
+                probe_wpm: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -341,6 +373,9 @@ impl Store {
             .prepare("SELECT id, started_ms FROM sessions WHERE started_ms < ?1 AND id NOT IN (SELECT session_id FROM archive)")?
             .query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
+        if sessions.is_empty() {
+            return Ok(0);
+        }
         let lines = self.live_lines(None)?;
         let tx = self.conn.transaction()?;
         for (session_id, started_ms) in &sessions {
@@ -370,15 +405,16 @@ impl Store {
         Ok(sessions.len())
     }
 
-    /// Most frequent mistakes in the live data: (expected char, key hit instead, count).
-    pub fn confusions(&self, limit: usize) -> Result<Vec<(String, u8, u32)>> {
+    /// Most frequent mistakes on one layout in the live data: (expected char, key hit
+    /// instead, count). Per layout, because the same key means different letters elsewhere.
+    pub fn confusions(&self, layout: LayoutId, geometry: Geometry, limit: usize) -> Result<Vec<(String, u8, u32)>> {
         let mut stmt = self.conn.prepare(
             "SELECT substr(l.text, c.pos + 1, 1) AS expected, c.wrong_key, COUNT(*) AS n
              FROM chars c JOIN lines l ON l.id = c.line_id
-             WHERE c.error = 1 AND c.wrong_key IS NOT NULL
-             GROUP BY expected, c.wrong_key ORDER BY n DESC LIMIT ?1",
+             WHERE c.error = 1 AND c.wrong_key IS NOT NULL AND l.layout = ?1 AND l.geometry = ?2
+             GROUP BY expected, c.wrong_key ORDER BY n DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map(params![layout.as_str(), geometry.as_str(), limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -554,7 +590,7 @@ fn push_rows(rows: &mut Vec<KeystrokeRow>, line_no: Option<u64>, session_id: Opt
             pos: k.pos,
             expected: chars.get(k.pos as usize).map(|c| c.to_string()).unwrap_or_default(),
             typed: k.typed.clone(),
-            key_code: k.key.map(|key| crate::layout::KEY_CODES[key as usize].to_string()).unwrap_or_default(),
+            key_code: k.key.and_then(|key| crate::layout::KEY_CODES.get(key as usize)).map(|c| c.to_string()).unwrap_or_default(),
             modifiers: k.modifiers,
             correct: k.correct,
         });
@@ -754,6 +790,87 @@ mod tests {
         // Keys survive archiving.
         s.archive_old_sessions(t + 40 * 86_400_000).unwrap();
         assert_eq!(s.keystrokes().unwrap(), rows);
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("reflex-test-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("reflex.sqlite")
+    }
+
+    #[test]
+    fn migrates_v1_database_with_data() {
+        let path = temp_db("v1");
+        {
+            // A v1 database as the first release wrote it, with one batch.
+            let conn = Connection::open(&path).unwrap();
+            let store = Store { conn, path: None };
+            store.step(1, "CREATE TABLE sessions (id INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL, layout TEXT NOT NULL, geometry TEXT NOT NULL);
+                 CREATE TABLE lines (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL, lang TEXT NOT NULL, layout TEXT NOT NULL, geometry TEXT NOT NULL, prev_char TEXT);
+                 CREATE TABLE chars (line_id INTEGER NOT NULL, pos INTEGER NOT NULL, latency_ms REAL, error INTEGER NOT NULL, wrong_key INTEGER, wall_ms INTEGER NOT NULL, session_sec REAL NOT NULL, PRIMARY KEY (line_id, pos)) WITHOUT ROWID;
+                 CREATE TABLE keys (line_id INTEGER NOT NULL, pos INTEGER NOT NULL, t_us INTEGER NOT NULL, wall_ms INTEGER NOT NULL, typed TEXT NOT NULL, key INTEGER, modifiers INTEGER NOT NULL, correct INTEGER NOT NULL);
+                 CREATE TABLE batches (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, ended_ms INTEGER NOT NULL, seconds REAL NOT NULL, chars INTEGER NOT NULL, errors INTEGER NOT NULL, wpm REAL NOT NULL, accuracy REAL NOT NULL, real_wpm REAL, arm INTEGER);
+                 CREATE TABLE archive (session_id INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL, blob BLOB NOT NULL);
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO batches (session_id, ended_ms, seconds, chars, errors, wpm, accuracy) VALUES (1, 5, 45.0, 200, 3, 53.3, 0.985);").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let version: i64 = s.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let b = &s.batches().unwrap()[0];
+        assert_eq!((b.chars, b.utc_offset_min, b.probe_wpm), (200, None, None));
+        // v2 tables work.
+        assert!(s.keystrokes().unwrap().is_empty());
+        // Reopening an up-to-date database is a no-op.
+        drop(s);
+        Store::open(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn failed_migration_step_leaves_the_old_version() {
+        let path = temp_db("halfway");
+        let store = Store { conn: Connection::open(&path).unwrap(), path: None };
+        store.step(1, "CREATE TABLE sessions (id INTEGER PRIMARY KEY);").unwrap();
+        // The second statement fails: the first must be rolled back with the version.
+        assert!(store.step(2, "CREATE TABLE extra (x INTEGER); CREATE TABLE sessions (id INTEGER);").is_err());
+        let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 1);
+        let extra: i64 = store.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'extra'", [], |r| r.get(0)).unwrap();
+        assert_eq!(extra, 0);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn batch_updates_by_id_and_reader_sees_them() {
+        let path = temp_db("reader");
+        let s = Store::open(&path).unwrap();
+        let b = BatchRecord { session_id: 1, ended_ms: 1, seconds: 45.0, chars: 100, errors: 1, wpm: 40.0, accuracy: 0.99, real_wpm: None, arm: None, utc_offset_min: Some(60), probe_wpm: None };
+        let first = s.insert_batch(&b).unwrap();
+        let second = s.insert_batch(&BatchRecord { ended_ms: 2, ..b.clone() }).unwrap();
+        // A late reply for the first batch must not touch the second.
+        s.update_batch(first, Some(42.0), Some(3), Some(39.5)).unwrap();
+        let reader = s.reader().unwrap();
+        let rows = reader.batches().unwrap();
+        assert_eq!((rows[0].real_wpm, rows[0].arm, rows[0].probe_wpm), (Some(42.0), Some(3), Some(39.5)));
+        assert_eq!((rows[1].real_wpm, rows[1].arm), (None, None));
+        assert!(second > first);
+        assert!(reader.set_setting("x", "y").is_err(), "reader is read-only");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn confusions_are_per_layout() {
+        let mut s = Store::open_in_memory().unwrap();
+        let sid = s.begin_session(LayoutId::DeIso, Geometry::Iso, 0).unwrap();
+        s.insert_line(sid, &line(1_000), &[]).unwrap();
+        let mut us = line(5_000);
+        us.layout = LayoutId::UsAnsi;
+        s.insert_line(sid, &us, &[]).unwrap();
+        assert_eq!(s.confusions(LayoutId::DeIso, Geometry::Iso, 8).unwrap(), vec![("l".to_string(), 5, 1)]);
+        assert_eq!(s.confusions(LayoutId::UsAnsi, Geometry::Iso, 8).unwrap().len(), 1);
+        assert!(s.confusions(LayoutId::EurKey, Geometry::Iso, 8).unwrap().is_empty());
     }
 
     #[test]

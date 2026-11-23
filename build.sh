@@ -36,12 +36,15 @@ module reflex_coreFFI {
     export *
 }
 MAP
-# Link statically: hide the dylib from the linker while building the app.
-mv core/target/release/libreflex_core.dylib core/target/release/libreflex_core.dylib.off
+# Link statically: hide the dylib from the linker while building the app (restored on any
+# exit, also Ctrl-C or a failed build).
+DYLIB=core/target/release/libreflex_core.dylib
+mv "$DYLIB" "$DYLIB.off"
+trap 'if [[ -f "$DYLIB.off" ]]; then mv "$DYLIB.off" "$DYLIB"; fi' EXIT
 
 echo "› app"
-(cd mac && swift build -c release --quiet) || { mv core/target/release/libreflex_core.dylib.off core/target/release/libreflex_core.dylib; exit 1; }
-mv core/target/release/libreflex_core.dylib.off core/target/release/libreflex_core.dylib
+(cd mac && swift build -c release --quiet)
+mv "$DYLIB.off" "$DYLIB"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -69,7 +72,10 @@ PLIST
 codesign --force --sign - "$APP" >/dev/null
 codesign --verify --strict "$APP"
 
-pkill -x Reflex 2>/dev/null || true
+# Quit a running copy before replacing it, and wait until it is gone (it holds reflex.lock).
+if pkill -x Reflex 2>/dev/null; then
+  for _ in {1..50}; do pgrep -x Reflex >/dev/null || break; sleep 0.1; done
+fi
 mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/Reflex.app"
 cp -R "$APP" "$INSTALL_DIR/"

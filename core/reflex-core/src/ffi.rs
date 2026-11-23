@@ -3,7 +3,7 @@
 
 use crate::content::{Lang, Pool, Vocabulary};
 use crate::engine::{self, Engine};
-use crate::layout::{Geometry, KEY_CODES, Layer, LayoutId, key_id};
+use crate::layout::{Geometry, KEY_CODES, Layer, Layout, LayoutId, key_id};
 use crate::session::KeyInput;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -60,6 +60,10 @@ pub struct TypingView {
     pub layout_name: String,
     /// Model estimate of speed on normal text, once available.
     pub real_wpm: Option<f64>,
+    /// Measured speed on recent probe lines (held-out sentences), once typed.
+    pub measured_wpm: Option<f64>,
+    /// The first visible line is a measurement line.
+    pub probe_line: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -98,6 +102,8 @@ pub struct DayPoint {
     pub wpm: f64,
     pub accuracy: f64,
     pub real_wpm: Option<f64>,
+    /// Mean measured speed of that day's probe lines.
+    pub measured_wpm: Option<f64>,
     pub minutes: f64,
 }
 
@@ -134,6 +140,29 @@ pub struct PairStat {
     pub ms: f64,
 }
 
+/// Real speed on one layout the person has typed on (transition view).
+#[derive(uniffi::Record)]
+pub struct LayoutSpeedStat {
+    pub layout: String,
+    pub name: String,
+    pub estimated_wpm: f64,
+    pub measured_wpm: Option<f64>,
+    pub keystrokes: f64,
+    pub active: bool,
+}
+
+/// A character whose movement differs between the active layout and the one you came from.
+#[derive(uniffi::Record)]
+pub struct MovedKey {
+    pub ch: String,
+    /// Measured mean time on the active layout (ms), first attempts.
+    pub now_ms: Option<f64>,
+    pub now_attempts: u32,
+    pub now_error_rate: f64,
+    /// Same character on the old layout.
+    pub before_ms: Option<f64>,
+}
+
 #[derive(uniffi::Record)]
 pub struct Confusion {
     pub expected: String,
@@ -150,8 +179,21 @@ pub struct Stats {
     /// Measured speed and errors per key.
     pub key_measured: Vec<KeyMeasured>,
     pub slow_pairs: Vec<PairStat>,
+    /// Practised pairs the model expects to fade most within a week without practice
+    /// (ms slower per press); the trainer schedules them before that happens.
+    pub fading_pairs: Vec<PairStat>,
     pub confusions: Vec<Confusion>,
     pub real_wpm: Option<f64>,
+    /// Measured speed on recent probe lines (active layout).
+    pub measured_wpm: Option<f64>,
+    /// Every layout typed on, with estimate and measurement.
+    pub layouts: Vec<LayoutSpeedStat>,
+    /// Display name of the layout you are switching from, while in transition.
+    pub transition_from: Option<String>,
+    /// Characters that moved, in transition (most practised on the old layout first).
+    pub moved_keys: Vec<MovedKey>,
+    /// The learning thread stopped (bug); typing still works but nothing is learnt.
+    pub learning_stopped: bool,
     /// 0…1: how sure the typist model is about you.
     pub confidence: f64,
     pub model_ready: bool,
@@ -225,6 +267,8 @@ impl ReflexEngine {
         let mut engine = self.lock();
         let v = engine.view();
         TypingView {
+            measured_wpm: v.measured_wpm,
+            probe_line: v.probe_line,
             lines: v.lines,
             cursor: v.cursor as u32,
             error_positions: v.error_positions.into_iter().map(|p| p as u32).collect(),
@@ -268,10 +312,10 @@ impl ReflexEngine {
         layout
             .geometry
             .keys()
-            .filter(|k| KEY_CODES[*k as usize] != "Enter")
+            .filter(|k| KEY_CODES.get(*k as usize).is_some_and(|c| *c != "Enter"))
             .map(|k| {
                 let g = layout.key(k);
-                let code = KEY_CODES[k as usize];
+                let code = KEY_CODES.get(k as usize).copied().unwrap_or("");
                 KeyCap {
                     code: code.to_string(),
                     row: g.row,
@@ -292,7 +336,7 @@ impl ReflexEngine {
         let strokes = layout.strokes(c)?;
         let main = *strokes.last()?;
         Some(KeyHint {
-            codes: strokes.iter().map(|s| KEY_CODES[s.key as usize].to_string()).collect(),
+            codes: strokes.iter().map(|s| code_name(s.key)).collect(),
             finger: layout.key(main.key).finger.index() as u8,
             shift: main.layer.shift(),
             option: strokes.iter().any(|s| s.layer.option()),
@@ -300,20 +344,25 @@ impl ReflexEngine {
     }
 
     /// Everything the progress screen shows. Also asks the learning thread for a fresh
-    /// forecast, which shows up in a later call.
+    /// forecast, which shows up in a later call. Slow queries run on a separate read-only
+    /// connection after the engine lock is released, so typing never waits for them.
     pub fn stats(&self) -> Result<Stats, ReflexError> {
-        let mut engine = self.lock();
-        engine.request_forecast();
-        let batches = engine.store().batches()?;
-        let confusions = engine.store().confusions(8)?;
-        let total_keystrokes = engine.store().total_chars()?;
-        let today_minutes = engine.today_minutes();
-        let offset = engine.utc_offset_min();
-        let layout = engine.layout().clone();
-        let char_stats = engine.store().char_stats(layout.id, layout.geometry)?;
-        let insights = engine.insights();
-        let gains = insights.gains.clone();
+        let (reader, today_minutes, offset, layout, gains, forecast, model_ready, measured_wpm, speeds, learning_stopped) = {
+            let mut engine = self.lock();
+            engine.request_forecast();
+            let today_minutes = engine.today_minutes();
+            let offset = engine.utc_offset_min();
+            let layout = engine.layout().clone();
+            let reader = engine.reader()?;
+            let i = engine.insights();
+            (reader, today_minutes, offset, layout, i.gains.clone(), i.forecast.clone(), i.model_ready, i.measured_wpm, i.layout_speeds.clone(), i.learning_stopped)
+        };
+        let batches = reader.batches()?;
+        let confusions = reader.confusions(layout.id, layout.geometry, 8)?;
+        let total_keystrokes = reader.total_chars()?;
+        let char_stats = reader.char_stats(layout.id, layout.geometry)?;
         let mut days: Vec<DayPoint> = Vec::new();
+        let mut probe_n: Vec<f64> = Vec::new();
         for b in &batches {
             // Each batch keeps the calendar day it was typed on; the point sits at that
             // day's midnight in the current zone, so the chart shows the right date.
@@ -326,7 +375,14 @@ impl ReflexEngine {
                     d.minutes += b.seconds / 60.0;
                     d.real_wpm = b.real_wpm.or(d.real_wpm);
                 }
-                _ => days.push(DayPoint { day_ms, wpm: b.wpm, accuracy: b.accuracy, real_wpm: b.real_wpm, minutes: b.seconds / 60.0 }),
+                _ => {
+                    days.push(DayPoint { day_ms, wpm: b.wpm, accuracy: b.accuracy, real_wpm: b.real_wpm, measured_wpm: None, minutes: b.seconds / 60.0 });
+                    probe_n.push(0.0);
+                }
+            }
+            if let (Some(p), Some(d), Some(n)) = (b.probe_wpm, days.last_mut(), probe_n.last_mut()) {
+                d.measured_wpm = Some((d.measured_wpm.unwrap_or(0.0) * *n + p) / (*n + 1.0));
+                *n += 1.0;
             }
         }
         let key_heat = gains.as_ref().map_or_else(Vec::new, |g| {
@@ -334,7 +390,7 @@ impl ReflexEngine {
             g.key_cost
                 .iter()
                 .map(|(k, v)| KeyHeat {
-                    code: KEY_CODES[*k as usize].to_string(),
+                    code: code_name(*k),
                     value: if hi > lo { ((v - lo) / (hi - lo)) as f64 } else { 0.0 },
                     ms: *v as f64,
                 })
@@ -343,31 +399,54 @@ impl ReflexEngine {
         let key_measured = crate::stats::key_measured(&char_stats, &layout)
             .into_iter()
             .map(|m| KeyMeasured {
-                code: KEY_CODES[m.key as usize].to_string(),
+                code: code_name(m.key),
                 attempts: m.attempts,
                 errors: m.errors,
                 error_rate: m.error_rate,
                 mean_ms: m.mean_ms,
             })
             .collect();
-        let label = |k: u8| layout.label(k, Layer::Base).filter(|l| !l.is_empty()).unwrap_or_else(|| KEY_CODES[k as usize].to_string());
+        let confusions = confusions.into_iter().map(|(e, k, n)| Confusion { typed: slip_label(&layout, &e, k), expected: e, count: n }).collect();
+        // Transition: you came from another layout with clearly more practice.
+        let total_on = |id: LayoutId| speeds.iter().filter(|s| s.layout == id).map(|s| s.keystrokes).sum::<f64>();
+        let from = speeds
+            .iter()
+            .filter(|s| s.layout != layout.id)
+            .max_by(|a, b| a.keystrokes.total_cmp(&b.keystrokes))
+            .filter(|s| s.keystrokes >= 2.0 * total_on(layout.id).max(500.0))
+            .copied();
+        let moved_keys = match from {
+            Some(f) => moved_keys(&reader, &layout, &Layout::new(f.layout, f.geometry), &char_stats)?,
+            None => Vec::new(),
+        };
+        let pairs = |v: &[(String, f32)]| v.iter().map(|(t, ms)| PairStat { text: t.clone(), ms: *ms as f64 }).collect::<Vec<_>>();
         Ok(Stats {
-            forecast: insights
-                .forecast
+            forecast: forecast
                 .as_ref()
                 .map_or_else(Vec::new, |f| f.points.iter().map(|(d, w, pm)| ForecastPoint { days: *d, wpm: *w, plus_minus: *pm }).collect()),
             key_heat,
             key_measured,
-            slow_pairs: gains.as_ref().map_or_else(Vec::new, |g| {
-                g.slow_pairs.iter().map(|(t, ms)| PairStat { text: t.clone(), ms: *ms as f64 }).collect()
-            }),
-            confusions: confusions
-                .into_iter()
-                .map(|(e, k, n)| Confusion { expected: e, typed: label(k), count: n })
-                .collect(),
+            slow_pairs: gains.as_ref().map_or_else(Vec::new, |g| pairs(&g.slow_pairs)),
+            fading_pairs: gains.as_ref().map_or_else(Vec::new, |g| pairs(&g.fading_pairs)),
+            confusions,
             real_wpm: gains.as_ref().map(|g| g.real_wpm).filter(|w| *w > 0.0),
+            measured_wpm,
+            layouts: speeds
+                .iter()
+                .map(|s| LayoutSpeedStat {
+                    layout: s.layout.as_str().to_string(),
+                    name: s.layout.display_name().to_string(),
+                    estimated_wpm: s.estimated_wpm,
+                    measured_wpm: s.measured_wpm,
+                    keystrokes: s.keystrokes,
+                    active: s.layout == layout.id,
+                })
+                .collect(),
+            transition_from: from.map(|f| f.layout.display_name().to_string()),
+            moved_keys,
+            learning_stopped,
             confidence: gains.as_ref().map_or(0.0, |g| (1.0 - 4.0 * g.uncertainty_ratio as f64).clamp(0.0, 1.0)),
-            model_ready: insights.model_ready,
+            model_ready,
             streak_days: crate::stats::streak_days(&batches, engine::now_ms(), offset),
             total_minutes: batches.iter().map(|b| b.seconds).sum::<f64>() / 60.0,
             today_minutes,
@@ -378,13 +457,16 @@ impl ReflexEngine {
 
     /// Write everything as JSON to `path` (keystrokes, lines, batches; archive included).
     pub fn export_json(&self, path: String) -> Result<(), ReflexError> {
-        let json = self.lock().store().export_json()?;
+        // Read-only connection: building a large export never blocks typing.
+        let reader = self.lock().reader()?;
+        let json = reader.export_json()?;
         write_atomic(&path, json.as_bytes())
     }
 
     /// Write every keystroke as one CSV row to `path` (archive included).
     pub fn export_csv(&self, path: String) -> Result<(), ReflexError> {
-        let csv = self.lock().store().export_csv()?;
+        let reader = self.lock().reader()?;
+        let csv = reader.export_csv()?;
         write_atomic(&path, csv.as_bytes())
     }
 }
@@ -399,4 +481,45 @@ fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), ReflexError> {
         std::fs::remove_file(&tmp).ok();
     }
     result.map_err(|e| ReflexError::Storage(format!("could not write {path}: {e}")))
+}
+
+/// W3C code of a key id (ids come from the database too, so never index blindly).
+fn code_name(k: u8) -> String {
+    KEY_CODES.get(k as usize).map_or_else(String::new, |c| c.to_string())
+}
+
+/// How to show the key hit instead of `expected`: its label, or the missing modifier when
+/// the right key was hit without Shift/Option.
+fn slip_label(layout: &Layout, expected: &str, wrong: u8) -> String {
+    let stroke = expected.chars().next().and_then(|c| layout.main_stroke(c));
+    if let Some(s) = stroke.filter(|s| s.key == wrong) {
+        return if s.layer.shift() { "no ⇧".into() } else if s.layer.option() { "no ⌥".into() } else { "same key".into() };
+    }
+    layout.label(wrong, Layer::Base).filter(|l| !l.is_empty()).unwrap_or_else(|| code_name(wrong))
+}
+
+/// Characters typed on `old` whose movement is different on `new`, with measured times on
+/// both (first attempts). Most practised on the old layout first.
+fn moved_keys(reader: &crate::store::Store, new: &Layout, old: &Layout, new_stats: &[crate::store::CharStat]) -> Result<Vec<MovedKey>, ReflexError> {
+    let old_stats = reader.char_stats(old.id, old.geometry)?;
+    let mean = |s: &crate::store::CharStat| (s.latency_n > 0).then(|| s.latency_sum_ms / s.latency_n as f64);
+    let mut out: Vec<(u32, MovedKey)> = old_stats
+        .iter()
+        .filter(|o| o.expected != ' ' && new.motor(o.expected).is_some() && new.motor(o.expected) != old.motor(o.expected))
+        .map(|o| {
+            let now = new_stats.iter().find(|n| n.expected == o.expected);
+            (
+                o.attempts,
+                MovedKey {
+                    ch: o.expected.to_string(),
+                    now_ms: now.and_then(mean),
+                    now_attempts: now.map_or(0, |n| n.attempts),
+                    now_error_rate: now.map_or(0.0, |n| n.errors as f64 / n.attempts.max(1) as f64),
+                    before_ms: mean(o),
+                },
+            )
+        })
+        .collect();
+    out.sort_by_key(|(attempts, _)| std::cmp::Reverse(*attempts));
+    Ok(out.into_iter().take(16).map(|(_, m)| m).collect())
 }

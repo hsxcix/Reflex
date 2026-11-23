@@ -1,11 +1,11 @@
 //! The learning loop for one person: observe typed lines, fine-tune the typist model
-//! (with replay, validation and rollback), recompute what practice is worth, and let the
-//! bandit pick the planner settings for the next batch. Used by the app's background
-//! worker and by the benchmarks alike.
+//! (with replay, validation and rollback), recompute what practice is worth, score probe
+//! lines (measured real speed), and let the bandit pick the planner settings for the next
+//! block of batches. Used by the app's background worker and by the benchmarks alike.
 
 use crate::content::Pool;
 use crate::history::PracticeHistory;
-use crate::layout::{Layout, LayoutId};
+use crate::layout::{Geometry, Layout, LayoutId};
 use crate::model::encode::{EncodedLine, encode_typed_line, record_line};
 use crate::model::train::{TrainParams, evaluate, train};
 use crate::model::TypistModel;
@@ -13,7 +13,8 @@ use crate::record::TypedLine;
 use crate::sim::Family;
 use crate::sim::data::simulate_history;
 use crate::trainer::bandit::{Bandit, Trial, context};
-use crate::trainer::gains::{GainTable, compute_gains, projected_wpm};
+use crate::trainer::gains::{GainTable, compute_gains, predicted_real_wpm, projected_wpm};
+use crate::trainer::probe::ProbeScorer;
 use crate::trainer::planner::{ARMS, Planner};
 use burn::module::Module;
 use burn::store::ModuleRecord;
@@ -28,12 +29,51 @@ const MAX_TRAIN_LINES: usize = 6000;
 /// Every n-th line goes to the validation split (never trained on).
 const VALID_EVERY: usize = 8;
 
+/// Probes after which observed speed changes count fully as much as the model's estimate
+/// in the bandit reward (shrinkage: few noisy probes barely move it, many dominate).
+const OBSERVED_HALF_WEIGHT_PROBES: f64 = 300.0;
+/// A bandit block ends at the first batch with a probe, or after this many minutes.
+const MAX_BLOCK_MINUTES: f64 = 6.0;
+
 pub struct LearnReport {
     pub valid_before: f32,
     pub valid_after: f32,
     pub kept: bool,
 }
 
+/// What one finished batch changed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchOutcome {
+    pub kept: bool,
+    /// Planner arm the batch was typed with.
+    pub played_arm: usize,
+    /// Model estimate of real speed after the batch.
+    pub real_wpm: f64,
+    /// Measured real speed of the latest probe typed in this batch, if any.
+    pub probe_wpm: Option<f64>,
+}
+
+/// Real speed on one layout: model estimate and probe measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutSpeed {
+    pub layout: LayoutId,
+    pub geometry: Geometry,
+    pub estimated_wpm: f64,
+    pub measured_wpm: Option<f64>,
+    pub keystrokes: f64,
+}
+
+/// Batches since the bandit last chose an arm.
+#[derive(Debug, Clone, Copy, Default)]
+struct Block {
+    context: Option<[f32; 3]>,
+    minutes: f64,
+    model_delta: f64,
+    /// Probe that closed the previous block (start of the observed change).
+    start_probe: Option<f64>,
+}
+
+#[derive(Clone)]
 pub struct Forecast {
     /// (days from now, predicted real WPM, uncertainty ±WPM)
     pub points: Vec<(u32, f64, f64)>,
@@ -52,13 +92,19 @@ pub struct Brain {
     seen_lines: usize,
     rng: StdRng,
     layout_cache: Option<Layout>,
+    probes: ProbeScorer,
+    block: Block,
+    /// Keystrokes per layout the person typed on.
+    layouts: Vec<(LayoutId, Geometry, f64)>,
     pub fine_tune_steps: usize,
 }
 
 impl Brain {
     /// `model` is a trained (or fresh) typist model; it is moved to an autodiff CPU device.
-    pub fn new(model: TypistModel, seed: u64) -> Brain {
+    /// `baseline` is the frozen pretrained model probes are scored with (never fine-tuned).
+    pub fn new(model: TypistModel, baseline: TypistModel, seed: u64) -> Brain {
         let device = crate::model::cpu();
+        let probes = ProbeScorer::new(baseline, device.clone());
         let model = model.fork(&device.clone().autodiff()).train();
         let rng = StdRng::seed_from_u64(seed);
         let replay = replay_set(seed);
@@ -76,6 +122,9 @@ impl Brain {
             seen_lines: 0,
             rng,
             layout_cache: None,
+            probes,
+            block: Block::default(),
+            layouts: Vec::new(),
             fine_tune_steps: 24,
         }
     }
@@ -153,6 +202,11 @@ impl Brain {
             let layout = self.layout_for(line.layout, line.geometry);
             let encoded = encode_typed_line(line, &layout, &self.history);
             record_line(&mut self.history, &layout, line);
+            self.probes.score(line, &layout);
+            match self.layouts.iter_mut().find(|(id, g, _)| *id == line.layout && *g == line.geometry) {
+                Some(entry) => entry.2 += line.chars.len() as f64,
+                None => self.layouts.push((line.layout, line.geometry, line.chars.len() as f64)),
+            }
             self.seen_lines += 1;
             if self.seen_lines.is_multiple_of(VALID_EVERY) {
                 self.valid_lines.push(encoded);
@@ -176,8 +230,9 @@ impl Brain {
         let params = TrainParams { steps: self.fine_tune_steps, batch_size: 32, lr: 4e-4, replay_share: 0.3 };
         let candidate = train(self.model.clone(), &self.train_lines[start..], &self.replay, &params, &device, &mut self.rng, |_, _| {});
         let after = evaluate(&candidate, &valid, &device);
-        // NaN (no validation data yet) counts as an improvement.
-        let kept = valid.is_empty() || after.is_nan() || after <= before * 1.002;
+        // Keep only if held-out prediction loss did not get worse (the loss can be negative,
+        // so no relative tolerance). NaN (no validation data yet) counts as an improvement.
+        let kept = valid.is_empty() || after.is_nan() || before.is_nan() || after <= before;
         if kept {
             self.model = candidate;
         }
@@ -192,16 +247,77 @@ impl Brain {
         self.gains.clone()
     }
 
-    /// Close a batch: reward the arm that was played and choose the next one.
-    pub fn end_batch(&mut self, real_before: f64, real_after: f64, minutes: f64) -> usize {
-        let ctx = context(self.history.total(), real_before, self.gains.uncertainty_ratio);
-        if minutes > 0.05 && real_before > 0.0 {
-            let reward = ((real_after - real_before) / minutes) as f32;
-            self.bandit.record(Trial { context: ctx, arm: self.arm, reward }, &mut self.rng);
+    /// Learn from a finished batch: observe, fine-tune, refresh gains, score probes, and
+    /// reward the bandit arm once a block ends.
+    ///
+    /// Reward = real-speed change per minute. The model part compares the *same* (updated)
+    /// model on the history before and after the batch, so model updates and forgetting
+    /// overnight don't count as practice. Once a block has probes at both ends, the
+    /// observed change is blended in with a weight that grows with the number of probes.
+    pub fn batch(&mut self, lines: &[TypedLine], minutes: f64, layout: &Layout, pool: &Pool, now_ms: i64) -> BatchOutcome {
+        let history_before = self.history.clone();
+        let probes_before = self.probes.count();
+        self.observe(lines);
+        let kept = self.learn().kept;
+        let model = self.model.valid();
+        let real_before = predicted_real_wpm(&model, &history_before, layout, pool, now_ms, &self.device);
+        let real_after = self.refresh(layout, pool, now_ms).real_wpm;
+        let probe_wpm = self.probes.results()[probes_before..].iter().rev().find(|r| r.layout == layout.id).map(|r| r.wpm);
+        let played_arm = self.arm;
+        if self.block.context.is_none() {
+            self.block.context = Some(context(history_before.total(), real_before, self.gains.uncertainty_ratio));
         }
-        let next_ctx = context(self.history.total(), real_after, self.gains.uncertainty_ratio);
+        self.block.minutes += minutes;
+        self.block.model_delta += real_after - real_before;
+        if probe_wpm.is_some() || self.block.minutes >= MAX_BLOCK_MINUTES {
+            self.close_block(probe_wpm, real_after);
+        }
+        BatchOutcome { kept, played_arm, real_wpm: real_after, probe_wpm }
+    }
+
+    fn close_block(&mut self, probe_wpm: Option<f64>, real_now: f64) {
+        let block = std::mem::take(&mut self.block);
+        if let Some(ctx) = block.context
+            && block.minutes > 0.05
+        {
+            let model_rate = block.model_delta / block.minutes;
+            let reward = match (block.start_probe, probe_wpm) {
+                (Some(a), Some(b)) => {
+                    let n = self.probes.count() as f64;
+                    let w = n / (n + OBSERVED_HALF_WEIGHT_PROBES);
+                    model_rate + w * ((b - a) / block.minutes - model_rate)
+                }
+                _ => model_rate,
+            };
+            self.bandit.record(Trial { context: ctx, arm: self.arm, reward: reward as f32 }, &mut self.rng);
+        }
+        self.block.start_probe = probe_wpm;
+        let next_ctx = context(self.history.total(), real_now, self.gains.uncertainty_ratio);
         self.arm = self.bandit.choose(next_ctx, &mut self.rng);
-        self.arm
+    }
+
+    /// Measured real speed (recent probes) on `layout`.
+    pub fn measured_wpm(&self, layout: LayoutId) -> Option<f64> {
+        self.probes.measured(layout)
+    }
+
+    /// Model estimate and measurement for every layout typed on (for the transition view).
+    pub fn layout_speeds(&mut self, pool: &Pool, now_ms: i64) -> Vec<LayoutSpeed> {
+        let model = self.model.valid();
+        let layouts = self.layouts.clone();
+        layouts
+            .into_iter()
+            .map(|(id, geometry, keystrokes)| {
+                let layout = self.layout_for(id, geometry);
+                LayoutSpeed {
+                    layout: id,
+                    geometry,
+                    estimated_wpm: predicted_real_wpm(&model, &self.history, &layout, pool, now_ms, &self.device),
+                    measured_wpm: self.probes.measured(id),
+                    keystrokes,
+                }
+            })
+            .collect()
     }
 
     pub fn planner(&self) -> Planner {

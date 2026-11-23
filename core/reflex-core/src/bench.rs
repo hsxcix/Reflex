@@ -11,7 +11,8 @@ use crate::model::encode::{encode_typed_line, record_line};
 use crate::record::TypedLine;
 use crate::sim::data::{SIM_START_MS, simulate_history};
 use crate::sim::{Family, SimTypist};
-use crate::trainer::gains::{GainTable, eval_texts};
+use crate::trainer::gains::{GainTable, ReferenceSet, eval_texts, reference_texts};
+use crate::trainer::probe::{PROBE_EVERY_LINES, probe_line};
 use crate::trainer::planner::{ARMS, Planner};
 use std::sync::Arc;
 use crate::trainer::heuristic::WeakestKeys;
@@ -54,6 +55,8 @@ pub struct BenchConfig {
 pub struct Curve {
     pub start_wpm: f64,
     pub points: Vec<(usize, f64)>,
+    /// True real speed one week after the last batch, without practice (retention).
+    pub retained_wpm: f64,
     /// Bandit outcomes of the ML trainer (used to build the simulation prior).
     pub trials: Vec<crate::trainer::bandit::Trial>,
 }
@@ -65,13 +68,15 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
     let params = family.sample(&layout, &mut rng);
     let mut typist = SimTypist::new(params, layout.clone(), SIM_START_MS);
     let pool = Pool::default();
-    let truth_texts = eval_texts(&pool, &layout);
+    // Ground truth is measured on the probe half of the reference sentences: the ML
+    // trainer's gain table is built on the other half, so it can't be tuned on the yardstick.
+    let truth_texts = reference_texts(&pool, &layout, ReferenceSet::Probe, 7);
     let mut now = SIM_START_MS;
     let start_wpm = typist.true_wpm(&truth_texts, now);
     let mut recent = RecentWords::default();
     let mut random = RandomSource::default();
     let mut heuristic = WeakestKeys::default();
-    let mut brain = (kind == TrainerKind::Ml).then(|| Brain::new(model.clone(), seed));
+    let mut brain = (kind == TrainerKind::Ml).then(|| Brain::new(model.clone(), model.clone(), seed));
     if let Some(b) = brain.as_mut() {
         b.restore_trials(Vec::new(), prior.to_vec());
         b.refresh(&layout, &pool, now);
@@ -79,7 +84,7 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
     let mut keystrokes = 0usize;
     let mut points = Vec::new();
     let mut session_sec = 0.0f32;
-    let mut real_before = brain.as_ref().map_or(0.0, |b| b.gains().real_wpm);
+    let mut lines_since_probe = PROBE_EVERY_LINES / 2;
     let mut rng_plan = StdRng::seed_from_u64(seed ^ 0xABCD);
     for batch in 0..cfg.batches {
         if batch > 0 && batch % cfg.batches_per_day == 0 {
@@ -94,10 +99,17 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
         let batch_start_sec = session_sec;
         for _ in 0..cfg.lines_per_batch {
             let ctx = PlanContext { pool: &pool, layout: &layout, recent: &recent };
-            let line = match (kind, planner.as_mut()) {
-                (TrainerKind::Ml | TrainerKind::Oracle, Some(p)) => p.next_line(&ctx, &mut rng_plan),
-                (TrainerKind::Heuristic, _) => heuristic.next_line(&ctx, &mut rng_plan),
-                _ => random.next_line(&ctx, &mut rng_plan),
+            // Every trainer types the same share of probe lines, as in the app.
+            lines_since_probe += 1;
+            let line = if lines_since_probe >= PROBE_EVERY_LINES {
+                lines_since_probe = 0;
+                probe_line(&pool, &layout, &mut rng_plan)
+            } else {
+                match (kind, planner.as_mut()) {
+                    (TrainerKind::Ml | TrainerKind::Oracle, Some(p)) => p.next_line(&ctx, &mut rng_plan),
+                    (TrainerKind::Heuristic, _) => heuristic.next_line(&ctx, &mut rng_plan),
+                    _ => random.next_line(&ctx, &mut rng_plan),
+                }
             };
             recent.note_line(&line.text);
             let t = typist.type_line(&line, Some(' '), now, &mut session_sec, &mut rng);
@@ -108,12 +120,7 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
         let minutes = (session_sec - batch_start_sec) as f64 / 60.0;
         match kind {
             TrainerKind::Ml => {
-                let b = brain.as_mut().expect("ml brain");
-                b.observe(&typed);
-                b.learn();
-                let real_after = b.refresh(&layout, &pool, now).real_wpm;
-                b.end_batch(real_before, real_after, minutes);
-                real_before = real_after;
+                brain.as_mut().expect("ml brain").batch(&typed, minutes, &layout, &pool, now);
             }
             TrainerKind::Heuristic => heuristic.observe(&typed),
             TrainerKind::Random | TrainerKind::Oracle => {}
@@ -121,7 +128,8 @@ pub fn run_trainer(kind: TrainerKind, family: Family, seed: u64, cfg: &BenchConf
         points.push((keystrokes, typist.true_wpm(&truth_texts, now)));
     }
     let trials = brain.map(|b| b.trials().to_vec()).unwrap_or_default();
-    Curve { start_wpm, points, trials }
+    let retained_wpm = typist.true_wpm(&truth_texts, now + 7 * 86_400_000);
+    Curve { start_wpm, points, retained_wpm, trials }
 }
 
 /// Keystrokes `curve` needed to first reach `level` (None if never).
@@ -147,7 +155,7 @@ pub fn prediction_quality(model: &TypistModel, typists: usize) -> (Quality, Qual
         let split = lines.len() * 2 / 3;
         let (train, test) = lines.split_at(split);
         let averages = PairAverages::fit(train);
-        let mut brain = Brain::new(model.clone(), i as u64);
+        let mut brain = Brain::new(model.clone(), model.clone(), i as u64);
         brain.fine_tune_steps = 40;
         for chunk in train.chunks(25) {
             brain.observe(chunk);
@@ -266,7 +274,7 @@ pub fn gain_accuracy(model: &TypistModel, family: Family, seed: u64, warmup_batc
     let params = family.sample(&layout, &mut rng);
     let mut typist = SimTypist::new(params, layout.clone(), SIM_START_MS);
     let pool = Pool::default();
-    let mut brain = Brain::new(model.clone(), seed);
+    let mut brain = Brain::new(model.clone(), model.clone(), seed);
     let mut recent = RecentWords::default();
     let mut random = RandomSource::default();
     let mut now = SIM_START_MS;
@@ -320,7 +328,8 @@ fn spearman(a: &[f64], b: &[f64]) -> f64 {
     cov / (va.sqrt() * vb.sqrt()).max(1e-12)
 }
 
-/// The simulator's true gain table (what a perfect typist model would predict).
+/// The simulator's true gain table (what a perfect typist model would predict), with the
+/// same horizons as the model's: practice now vs. left alone, 1/7/30 days ahead.
 pub fn true_gains(typist: &SimTypist, layout: &Layout, pool: &Pool, now: i64) -> GainTable {
     let texts = eval_texts(pool, layout);
     let mut table = GainTable::default();
@@ -329,12 +338,16 @@ pub fn true_gains(typist: &SimTypist, layout: &Layout, pool: &Pool, now: i64) ->
         let chars: Vec<char> = t.chars().collect();
         for i in 0..chars.len() {
             let prev = if i == 0 { Some(' ') } else { Some(chars[i - 1]) };
-            let (Some(key), Some(a), Some(b)) = (
-                pair_key(layout, prev, chars[i]),
-                typist.expected_ms_with_extra(prev, chars[i], now, 0.0),
-                typist.expected_ms_with_extra(prev, chars[i], now, 4.0),
-            ) else { continue };
-            *table.gain.entry(key).or_default() += a - b;
+            let Some(key) = pair_key(layout, prev, chars[i]) else { continue };
+            let gain: f32 = crate::trainer::gains::HORIZONS
+                .iter()
+                .filter_map(|&(days, w)| {
+                    let alone = typist.expected_ms_ahead(prev, chars[i], now, days, 0.0)?;
+                    let practised = typist.expected_ms_ahead(prev, chars[i], now, days, 4.0)?;
+                    Some(w * (alone - practised).max(0.0))
+                })
+                .sum();
+            *table.gain.entry(key).or_default() += gain;
             n += 1;
         }
     }

@@ -130,13 +130,33 @@ impl SimTypist {
         self.mean_and_error_n(prev, c, now_ms, session_sec, 0.0)
     }
 
+    /// Ground truth `days` ahead of `now_ms`: expected cost if the pair gets `extra`
+    /// repetitions now (which also restarts its fade clock), or is left alone (`extra == 0`).
+    pub fn expected_ms_ahead(&self, prev: Option<char>, c: char, now_ms: i64, days: f32, extra: f32) -> Option<f32> {
+        let p = &self.params;
+        let keep = |d: f32| 1.0 - p.forget_share * (1.0 - (-d / p.forget_days).exp());
+        let later = now_ms + (days as f64 * DAY_MS) as i64;
+        let (mean, err) = self.mean_and_error_with(prev, c, 0.0, |pair| {
+            if extra > 0.0 {
+                (self.practice.get(&pair).map_or(0.0, |q| q.count) + extra) * keep(days)
+            } else {
+                self.effective_practice(pair, later)
+            }
+        })?;
+        Some(mean * (1.0 + 2.0 * err))
+    }
+
     fn mean_and_error_n(&self, prev: Option<char>, c: char, now_ms: i64, session_sec: f32, extra: f32) -> Option<(f32, f32)> {
+        self.mean_and_error_with(prev, c, session_sec, |pair| self.effective_practice(pair, now_ms) + extra)
+    }
+
+    fn mean_and_error_with(&self, prev: Option<char>, c: char, session_sec: f32, practice: impl Fn((Motor, Motor)) -> f32) -> Option<(f32, f32)> {
         let p = &self.params;
         let strokes = self.layout.strokes(c)?;
         let main = *strokes.last()?;
         let prev_main = prev.and_then(|pc| self.layout.main_stroke(pc));
         let pair = pair_key(&self.layout, prev, c)?;
-        let n = self.effective_practice(pair, now_ms) + extra;
+        let n = practice(pair);
         let skill = self.skill(n);
         let untrained = (skill - p.asym) / (1.0 - p.asym);
         let weak = p.weak_pairs.get(&pair).map_or(1.0, |w| 1.0 + (w - 1.0) * untrained.sqrt());

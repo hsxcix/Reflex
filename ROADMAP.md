@@ -19,4 +19,16 @@ Stand 23.11.2026. [Entscheidungen zur Umsetzung](DECISIONS.md)
 - [x] **Laufende Zeile exportieren.** *Spalte `status` (finished / open / abandoned) ersetzt `abandoned`.* CSV und JSON lassen die bereits gespeicherten Anschläge der aktuellen Zeile bis zum Abschluss oder Neustart aus. **Abnahme.** Mitten in der Zeile exportieren und einen Fehlversuch samt Korrektur in beiden Formaten als laufend erkennen. Nach Zeilenabschluss oder Neustart erscheint jeder Anschlag weiterhin genau einmal mit dem passenden Status. [Export](core/reflex-core/src/store/mod.rs)
 - [x] **Historische Sitzungen dem richtigen lokalen Tag zuordnen.** *Jeder Batch speichert seinen UTC-Offset (Schema v3). Ältere Batches ohne Offset nutzen weiter den aktuellen.* Die Tageswerte und die Serie verwenden den aktuellen UTC-Offset auch für ältere Sitzungen. Dadurch kann eine Berliner Sitzung vom 11. Juli um 00:30 Uhr nach der Umstellung auf Winterzeit auf den 10. Juli rutschen. **Abnahme.** Eine Sitzung kurz nach Mitternacht behält über einen Sommerzeitwechsel hinweg ihren lokalen Kalendertag in Diagramm und Serie. [Tagesstatistik](core/reflex-core/src/ffi.rs) · [Kalendertage](core/reflex-core/src/stats.rs)
 
-Für das Trainingsmodell bleibt die Schätzung des Lerngewinns laut Benchmark der nächste Ansatzpunkt. [Benchmark-Ergebnisse](DECISIONS.md)
+## Zweite Prüfung (erledigt 23.11.2026)
+
+- [x] Stufe 1: Tastenwiederholung, Antworten des Lern-Threads, gespeicherte Strategie, Bandit-Stichprobe, Modell-Rollback, Sitzungsuhr und Pausen, verworfene Zeilen, Benchmark-Leck
+- [x] Stufe 2: atomare Datenbank-Updates, Export und Statistik ohne Tipp-Blockade, Tastaturwechsel ISO/ANSI, unbekannte Layouts mit Hinweis, Prognose ab heute, Verwechslungen pro Layout, Caps-Lock-Hinweis, Menübefehle für alle Schalter
+- [x] Gemessenes Tempo über Messzeilen, im Bandit-Lohn eingemischt
+- [x] Vergessen vorhersagen: Gewinn über 1/7/30 Tage, Liste „bald vergessen“
+- [x] Umstiegs-Ansicht DE → US
+- [x] Mehr Tests (Migrationen, Bandit, Worker, Sitzung mit Zufalls-Tastenfolgen, Messzeilen, Vergessen) und Smoke-Test über den echten Tastenweg
+
+## Offen
+
+- Langer Benchmark über Wochen mit Pausen, damit sich der Nutzen der Vergessens-Planung messen lässt (im 5-Tage-Benchmark nur im Rauschen)
+- Schätzung des Lerngewinns bleibt der größte Hebel (ML 14 % weniger Anschläge als Zufallstext, Orakel 42 %) [Benchmark-Ergebnisse](DECISIONS.md)

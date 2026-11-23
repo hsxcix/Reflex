@@ -21,6 +21,12 @@ struct TopBar: View {
             }
             Chip(label: "{ code }", on: model.pool.code) { model.toggleCode() }
             Spacer()
+            if model.capsLock {
+                Badge(text: "⇪ caps lock", help: "Caps Lock is on: letters come out in capitals and count as mistakes")
+            }
+            if let note = model.layoutNote {
+                Badge(text: "layout?", help: note)
+            }
             LiveNumbers()
             Button { model.showStats() } label: {
                 Image(systemName: "chart.line.uptrend.xyaxis")
@@ -44,9 +50,12 @@ struct LiveNumbers: View {
                 Text("\(Int(model.view.liveWpm.rounded())) wpm")
                 Text(String(format: "%.0f%%", model.view.liveAccuracy * 100))
             }
-            if let real = model.view.realWpm {
-                Text("real \(Int(real.rounded()))").foregroundStyle(Theme.accent)
-                    .help("Estimated speed on normal text, from your typist model")
+            if let measured = model.view.measuredWpm {
+                Text("real \(Int(measured.rounded()))").foregroundStyle(Theme.accent)
+                    .help("Measured on recent measurement lines (sentences never used for practice), errors included")
+            } else if let real = model.view.realWpm {
+                Text("real ~\(Int(real.rounded()))").foregroundStyle(Theme.accent)
+                    .help("Estimated speed on normal text, from your typist model (no measurement line typed yet)")
             }
             DailyRing(minutes: model.view.todayMinutes)
         }
@@ -71,6 +80,24 @@ struct Chip: View {
         }
         .buttonStyle(.plain)
         .focusable(false)
+        .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+/// Small warning pill in the top bar (Caps Lock, unsupported layout).
+struct Badge: View {
+    let text: String
+    let help: String
+
+    var body: some View {
+        Text(text)
+            .font(Theme.mono(11, weight: .semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .foregroundStyle(Theme.error)
+            .background(Capsule().fill(Theme.error.opacity(0.12)))
+            .help(help)
+            .accessibilityLabel(help)
     }
 }
 
@@ -88,5 +115,8 @@ struct DailyRing: View {
         }
         .frame(width: 14, height: 14)
         .help("\(Int(minutes)) of 15 minutes today")
+        .accessibilityElement()
+        .accessibilityLabel("Practice today")
+        .accessibilityValue("\(Int(minutes)) of 15 minutes")
     }
 }

@@ -13,6 +13,9 @@ struct TypingScreen: View {
             Spacer(minLength: 20)
             TextStage()
                 .padding(.horizontal, 56)
+            Text(model.view.probeLine ? "measurement line · just type it naturally" : " ")
+                .font(Theme.mono(11)).foregroundStyle(Theme.muted)
+                .help("Sentences never used for practice; they measure your real speed")
             Spacer(minLength: 20)
             ZStack {
                 KeyboardHintView()
@@ -21,14 +24,18 @@ struct TypingScreen: View {
             .frame(height: 190)
             .padding(.bottom, 26)
         }
-        .background(KeyCaptureView(onKey: model.handle, onEscape: model.showStats))
+        .background(KeyCaptureView(onKey: model.handle, onEscape: model.showStats, onFlags: model.flagsChanged))
         .onContinuousHover { phase in
             if case .active = phase { model.mouseMoved() }
         }
         .overlay {
             if let error = model.startupError {
-                Text("Reflex couldn't open its data: \(error)")
-                    .font(.callout).foregroundStyle(Theme.error).padding()
+                ZStack {
+                    Theme.surface.opacity(0.94)
+                    Text("Reflex couldn't open its data:\n\(error)")
+                        .multilineTextAlignment(.center)
+                        .font(Theme.mono(14)).foregroundStyle(Theme.error).padding(40)
+                }
             }
         }
     }
@@ -43,7 +50,7 @@ struct TextStage: View {
     var body: some View {
         GeometryReader { geo in
             let lines = model.view.lines
-            let longest = max(lines.map(\.count).max() ?? 40, 40)
+            let longest = max(lines.map(\.unicodeScalars.count).max() ?? 40, 40)
             let size = min(30, max(17, geo.size.width / (CGFloat(longest) * 0.62)))
             let charWidth = size * 0.6021
             let lineHeight = size * 1.75
@@ -84,7 +91,7 @@ extension TextStage {
     /// The rest of the current line from the cursor, for VoiceOver.
     private var accessibleLine: String {
         guard let line = model.view.lines.first else { return "" }
-        let rest = String(line.dropFirst(Int(model.view.cursor)))
+        let rest = String(String.UnicodeScalarView(line.unicodeScalars.dropFirst(Int(model.view.cursor))))
         let hasError = model.view.errorPositions.contains(model.view.cursor)
         return (hasError ? "Wrong key. " : "") + "Next: " + rest
     }
@@ -104,7 +111,9 @@ struct LineText: View {
         var result = AttributedString()
         let errors = Set(view.errorPositions.map(Int.init))
         let cursor = Int(view.cursor)
-        for (i, ch) in line.enumerated() {
+        // The core counts Unicode scalars (Rust chars), so index by scalar, not grapheme.
+        for (i, scalar) in line.unicodeScalars.enumerated() {
+            let ch = Character(scalar)
             var piece = AttributedString(String(ch == " " && index == 0 && errors.contains(i) ? "·" : ch))
             if index == 0 && i < cursor {
                 piece.foregroundColor = errors.contains(i) ? Theme.error.opacity(0.75) : Theme.typed
@@ -135,6 +144,7 @@ struct BatchLine: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var visible = Local(false)
+    @StateObject private var hideTask = Local<Task<Void, Never>?>(nil)
 
     var body: some View {
         Group {
@@ -158,8 +168,10 @@ struct BatchLine: View {
         .animation(.easeInOut(duration: 0.4), value: visible.value)
         .onChange(of: model.batchToken) {
             visible.value = true
-            Task {
+            hideTask.value?.cancel()
+            hideTask.value = Task {
                 try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
                 visible.value = false
             }
         }

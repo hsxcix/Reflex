@@ -81,6 +81,14 @@ impl Planner {
         &self.cache[&key]
     }
 
+    /// Precompute word weights for every language of `pool` (done on the learning thread,
+    /// so the first line after a planner swap doesn't score 20k words on the UI thread).
+    pub fn prepare(&mut self, pool: &crate::content::Pool, layout: &crate::layout::Layout) {
+        for lang in &pool.languages {
+            self.word_weights(*lang, pool.vocabulary, layout);
+        }
+    }
+
     fn mix(&self) -> Mix {
         // More real-world text when digits and symbols carry much of the potential gain.
         let real_world = (0.04 + 0.5 * self.gains.symbol_share as f64).min(0.3);
@@ -92,7 +100,7 @@ impl LineSource for Planner {
     fn next_line(&mut self, ctx: &PlanContext, rng: &mut StdRng) -> PlannedLine {
         let lang = ctx.pool.pick_language(rng);
         match self.mix().pick(ctx.pool, rng) {
-            ContentKind::Sentence => lines::sentence_line(lang, ctx.layout, |s| self.value(s, ctx.layout), 24, rng),
+            ContentKind::Sentence | ContentKind::Probe => lines::sentence_line(lang, ctx.layout, |s| self.value(s, ctx.layout), 24, rng),
             ContentKind::RealWorld => {
                 let a = lines::real_world(lang, ctx.layout, rng);
                 let b = lines::real_world(lang, ctx.layout, rng);

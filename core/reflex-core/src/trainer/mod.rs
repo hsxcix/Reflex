@@ -6,6 +6,7 @@ pub mod gains;
 pub mod heuristic;
 pub mod lines;
 pub mod planner;
+pub mod probe;
 pub mod random;
 
 use crate::content::Pool;

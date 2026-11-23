@@ -25,6 +25,12 @@ final class AppModel {
     /// Shown as an alert; set when something the user did could not be completed.
     var errorMessage: String?
     private(set) var exporting = false
+    /// Caps Lock is on: every letter would count as a mistake.
+    private(set) var capsLock = NSEvent.modifierFlags.contains(.capsLock)
+    /// Set when the macOS layout has no Reflex table (judged with the closest one).
+    private(set) var layoutNote: String?
+    @ObservationIgnored private var iso = PhysicalKey.isISO
+    @ObservationIgnored private var statsTask: Task<Void, Never>?
 
     @ObservationIgnored let engine: ReflexEngine?
     @ObservationIgnored private var hesitationTask: Task<Void, Never>?
@@ -63,7 +69,8 @@ final class AppModel {
             startupError = error.localizedDescription
         }
         view = engine?.view() ?? TypingView(lines: [], cursor: 0, errorPositions: [], liveWpm: 0,
-                                             liveAccuracy: 1, todayMinutes: 0, layoutName: "", realWpm: nil)
+                                             liveAccuracy: 1, todayMinutes: 0, layoutName: "", realWpm: nil,
+                                             measuredWpm: nil, probeLine: false)
         pool = engine?.pool() ?? PoolSettings(languages: ["de", "en"], vocabulary: "broad", code: false)
         applyInputSource()
         layoutObserver = InputSource.observe { [weak self] in
@@ -95,8 +102,10 @@ final class AppModel {
 
     /// Show an error once; while an alert is open, further errors don't stack up.
     func report(_ error: Error) {
-        guard errorMessage == nil else { return }
-        errorMessage = error.localizedDescription
+        let text = error.localizedDescription
+        guard let current = errorMessage else { errorMessage = text; return }
+        // An alert is open: add new problems to it instead of dropping them.
+        if !current.contains(text) { errorMessage = current + "\n\n" + text }
     }
 
     /// True while keys are coming in; turns false 2.5 s after the last key.
@@ -106,6 +115,11 @@ final class AppModel {
 
     func handle(_ key: CapturedKey) {
         guard let engine, screen == .typing else { return }
+        // Another keyboard (ISO / ANSI) was used: re-map before judging this key.
+        if key.iso != iso {
+            iso = key.iso
+            applyInputSource()
+        }
         let event = KeyEvent(code: key.code, chars: key.chars, modifiers: key.modifiers,
                              timestampUs: key.timestampUs, isDead: key.isDead)
         let result: KeyResult
@@ -146,10 +160,35 @@ final class AppModel {
         updatePool(PoolSettings(languages: pool.languages, vocabulary: pool.vocabulary, code: !pool.code))
     }
 
+    func flagsChanged(_ flags: NSEvent.ModifierFlags) {
+        let on = flags.contains(.capsLock)
+        if on != capsLock { capsLock = on }
+    }
+
     func showStats() {
         engine?.pause()
-        do { stats = try engine?.stats() } catch { report(error) }
         screen = .stats
+        loadStats()
+    }
+
+    /// Stats queries run off the main thread (the core uses its own read connection).
+    private func loadStats() {
+        guard let engine else { return }
+        statsTask?.cancel()
+        statsTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Result { try engine.stats() }
+            await MainActor.run {
+                guard let self, !Task.isCancelled else { return }
+                switch result {
+                case .success(let s): self.stats = s
+                case .failure(let e): self.report(e)
+                }
+            }
+        }
+    }
+
+    func setLanguage(_ language: String, on: Bool) {
+        if pool.languages.contains(language) != on { togglePool(language: language) }
     }
 
     /// While the stats screen is open, refresh a few times so the forecast (computed in
@@ -158,7 +197,7 @@ final class AppModel {
         for _ in 0..<6 {
             try? await Task.sleep(for: .seconds(1.5))
             guard screen == .stats else { return }
-            stats = try? engine?.stats()
+            loadStats()
         }
     }
 
@@ -207,8 +246,9 @@ final class AppModel {
 
     private func applyInputSource() {
         guard let engine else { return }
-        let source = InputSource.current()
+        let source = InputSource.current(iso: iso)
         do { try engine.setLayout(layout: source.layout, geometry: source.geometry) } catch { report(error) }
+        layoutNote = source.supported ? nil : "“\(source.name)” isn't supported yet; judged as \(engine.view().layoutName)"
         keyboard = engine.keyboard()
         view = engine.view()
     }

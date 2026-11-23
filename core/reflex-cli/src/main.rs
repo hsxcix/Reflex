@@ -172,6 +172,7 @@ fn bench(path: &std::path::Path, per_family: usize, batches: usize, lines: usize
     let mut savings_vs = [Vec::new(), Vec::new()];
     let mut oracle_savings = Vec::new();
     let mut gains = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut retained = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for family in Family::HELD_OUT {
         for i in 0..per_family {
             let seed = 700_000 + i as u64 * 101 + family as u64 * 7;
@@ -181,6 +182,9 @@ fn bench(path: &std::path::Path, per_family: usize, batches: usize, lines: usize
             let finals: Vec<f64> = curves.iter().map(|c| c.points.last().map_or(start, |p| p.1)).collect();
             for (g, f) in gains.iter_mut().zip(&finals) {
                 g.push(f - start);
+            }
+            for (r, c) in retained.iter_mut().zip(&curves) {
+                r.push(c.retained_wpm - start);
             }
             let budget = curves[0].points.last().map_or(1, |p| p.0) as f64;
             for (j, base) in [0usize, 1].iter().enumerate() {
@@ -197,8 +201,8 @@ fn bench(path: &std::path::Path, per_family: usize, batches: usize, lines: usize
         }
     }
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-    for (k, g) in kinds.iter().zip(&gains) {
-        println!("mean gain {:<13} {:+.2} wpm", k.name(), mean(g));
+    for ((k, g), r) in kinds.iter().zip(&gains).zip(&retained) {
+        println!("mean gain {:<13} {:+.2} wpm · after a week off {:+.2} wpm", k.name(), mean(g), mean(r));
     }
     println!("ML keystrokes saved vs random text:  {:.0}%", 100.0 * mean(&savings_vs[0]));
     println!("ML keystrokes saved vs weakest keys: {:.0}%", 100.0 * mean(&savings_vs[1]));

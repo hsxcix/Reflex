@@ -6,7 +6,7 @@ use crate::session::PlannedLine;
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Target visible line length in characters.
 pub const LINE_CHARS: usize = 54;
@@ -17,18 +17,27 @@ const RECENT_WINDOW: usize = 120;
 #[derive(Debug, Default, Clone)]
 pub struct RecentWords {
     words: VecDeque<String>,
+    /// How often each word occurs in `words` (O(1) lookups when filtering 20k words).
+    counts: HashMap<String, u32>,
 }
 
 impl RecentWords {
     pub fn contains(&self, w: &str) -> bool {
-        self.words.iter().any(|x| x == w)
+        self.counts.contains_key(w)
     }
 
     pub fn note_line(&mut self, text: &str) {
         for w in text.split_whitespace() {
             self.words.push_back(w.to_string());
-            if self.words.len() > RECENT_WINDOW {
-                self.words.pop_front();
+            *self.counts.entry(w.to_string()).or_default() += 1;
+            if self.words.len() > RECENT_WINDOW
+                && let Some(old) = self.words.pop_front()
+                && let Some(n) = self.counts.get_mut(&old)
+            {
+                *n -= 1;
+                if *n == 0 {
+                    self.counts.remove(&old);
+                }
             }
         }
     }
@@ -82,7 +91,7 @@ pub fn weighted_word_line(
         used.push(&pick.text);
     }
     if line.is_empty() {
-        line = "reflex".into();
+        line = fallback_words(layout);
     }
     PlannedLine::new(&line, ContentKind::Words, lang)
 }
@@ -102,8 +111,13 @@ pub fn sentence_line(
         .max_by(|a, b| score(a).total_cmp(&score(b)));
     match best {
         Some(s) => PlannedLine::new(s, ContentKind::Sentence, lang),
-        None => PlannedLine::new(&real_world_line(lang, rng), ContentKind::RealWorld, lang),
+        None => real_world(lang, layout, rng),
     }
+}
+
+/// Last resort when nothing else can be typed on `layout`: plain letters every layout has.
+fn fallback_words(layout: &Layout) -> String {
+    ["reflex", "asdf jkl", "test"].into_iter().find(|w| layout.can_type(w)).unwrap_or("a").to_string()
 }
 
 pub fn real_world(lang: Lang, layout: &Layout, rng: &mut StdRng) -> PlannedLine {
@@ -113,7 +127,8 @@ pub fn real_world(lang: Lang, layout: &Layout, rng: &mut StdRng) -> PlannedLine 
             return PlannedLine::new(&text, ContentKind::RealWorld, lang);
         }
     }
-    PlannedLine::new("12 + 30 = 42", ContentKind::RealWorld, lang)
+    let text = if layout.can_type("12 + 30 = 42") { "12 + 30 = 42".to_string() } else { fallback_words(layout) };
+    PlannedLine::new(&text, ContentKind::RealWorld, lang)
 }
 
 pub fn code_line(lang: Lang, layout: &Layout, score: impl Fn(&str) -> f64, rng: &mut StdRng) -> PlannedLine {
@@ -122,9 +137,9 @@ pub fn code_line(lang: Lang, layout: &Layout, score: impl Fn(&str) -> f64, rng: 
         .filter_map(|_| lines.choose(rng))
         .filter(|l| layout.can_type(l))
         .max_by(|a, b| score(a).total_cmp(&score(b)))
-        .copied()
-        .unwrap_or("let x = 1;");
-    PlannedLine::new(best, ContentKind::Code, lang)
+        .map(|l| l.to_string())
+        .unwrap_or_else(|| if layout.can_type("let x = 1;") { "let x = 1;".into() } else { fallback_words(layout) });
+    PlannedLine::new(&best, ContentKind::Code, lang)
 }
 
 /// Mix of content kinds a trainer wants, as probabilities.

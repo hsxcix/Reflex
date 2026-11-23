@@ -116,17 +116,68 @@ impl Bandit {
         let weight: Vec<f32> = data.iter().map(|(_, w)| *w).collect();
         let x = Tensor::<2>::from_data(TensorData::new(x, [n, N_CONTEXT + ARMS.len()]), &device);
         let y = Tensor::<2>::from_data(TensorData::new(y, [n, 1]), &device);
+        // Bootstrap: each head sees its own resample of the trials, fixed for the whole fit
+        // (a fresh mask per step would let every head see all data and collapse the ensemble).
+        let w: Vec<f32> = bootstrap_mask(n, rng).into_iter().enumerate().map(|(i, keep)| if keep { weight[i / HEADS] } else { 0.0 }).collect();
+        let w = Tensor::<2>::from_data(TensorData::new(w, [n, HEADS]), &device);
         for _ in 0..40 {
-            // Bootstrap: each head sees a different resample of the trials.
-            let w: Vec<f32> = (0..n * HEADS)
-                .map(|i| if rng.random::<f64>() < 0.632 { weight[i / HEADS] } else { 0.0 })
-                .collect();
-            let w = Tensor::<2>::from_data(TensorData::new(w, [n, HEADS]), &device);
             let pred = net.forward(x.clone());
-            let loss = ((pred - y.clone()).powf_scalar(2.0) * w.clone()).sum() / (w.sum() + 1.0);
+            let loss = ((pred - y.clone()).powf_scalar(2.0) * w.clone()).sum() / (w.clone().sum() + 1.0);
             let grads = GradientsParams::from_grads(loss.backward(), &net);
             net = optim.step(3e-3, net, grads);
         }
         self.net = net.valid().to_device(&self.device);
+    }
+
+    /// Value estimates per arm and head for `context` (rows = arms).
+    pub fn values(&self, context: [f32; N_CONTEXT]) -> Vec<[f32; HEADS]> {
+        let x: Vec<f32> = (0..ARMS.len()).flat_map(|a| Self::features(&context, a)).collect();
+        let x = Tensor::<2>::from_data(TensorData::new(x, [ARMS.len(), N_CONTEXT + ARMS.len()]), &self.device);
+        let v = self.net.valid().forward(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap_or_default();
+        v.chunks(HEADS).map(|c| std::array::from_fn(|h| c.get(h).copied().unwrap_or(0.0))).collect()
+    }
+}
+
+/// Which (trial, head) pairs a fit trains on: each head keeps ~63% of the trials (a
+/// bootstrap resample), row-major `[trial][head]`.
+fn bootstrap_mask(n: usize, rng: &mut StdRng) -> Vec<bool> {
+    (0..n * HEADS).map(|_| rng.random::<f64>() < 0.632).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn heads_disagree_where_data_is_thin() {
+        // A bootstrap ensemble must keep some spread; with a per-step mask it collapsed.
+        let device = crate::model::cpu();
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut bandit = Bandit::new(&device);
+        let trials: Vec<Trial> = (0..24)
+            .map(|i| Trial { context: [0.5, 0.4, 0.1], arm: i % 2, reward: if i % 4 < 2 { 1.0 } else { -1.0 } })
+            .collect();
+        bandit.restore(trials, Vec::new(), &mut rng);
+        let values = bandit.values([0.5, 0.4, 0.1]);
+        let spread: f32 = values.iter().map(|h| {
+            let (lo, hi) = h.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+            hi - lo
+        }).sum();
+        assert!(spread > 1e-3, "heads identical: {values:?}");
+    }
+
+    #[test]
+    fn learns_the_better_arm() {
+        let device = crate::model::cpu();
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut bandit = Bandit::new(&device);
+        let ctx = [0.6, 0.5, 0.1];
+        let trials: Vec<Trial> = (0..120)
+            .map(|i| Trial { context: ctx, arm: i % ARMS.len(), reward: if i % ARMS.len() == 3 { 1.0 } else { 0.0 } })
+            .collect();
+        bandit.restore(trials, Vec::new(), &mut rng);
+        let picks = (0..200).filter(|_| bandit.choose(ctx, &mut rng) == 3).count();
+        assert!(picks > 120, "picked the best arm {picks} of 200 times");
     }
 }

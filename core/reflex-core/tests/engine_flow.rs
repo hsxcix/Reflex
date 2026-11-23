@@ -1,7 +1,12 @@
 //! End to end: type a full batch through the engine, then check storage and the learning
 //! worker's update (planner + real-speed estimate).
 
+use reflex_core::brain::Brain;
+use reflex_core::content::{ContentKind, Pool};
 use reflex_core::engine::Engine;
+use reflex_core::history::{PracticeHistory, pair_key};
+use reflex_core::layout::Layout;
+use reflex_core::trainer::gains::compute_gains;
 use reflex_core::layout::{Geometry, LayoutId, key_id};
 use reflex_core::session::KeyInput;
 use reflex_core::store::{KeyStatus, StoreError};
@@ -47,12 +52,53 @@ fn typing_a_batch_trains_and_plans() {
     assert_eq!(correct.len(), lines.iter().map(|l| l.chars.len()).sum::<usize>());
     assert_eq!(rows.iter().filter(|r| !r.correct).count(), keys / 15 + usize::from(keys % 15 > 7));
 
-    // The learning thread fine-tunes, re-plans and reports a real-speed estimate.
+    // A measurement (probe) line was served among the practice lines.
+    assert!(lines.iter().any(|l| l.kind == ContentKind::Probe), "no probe line in {} lines", lines.len());
+
+    // Forecast requests queued around the batch must not be mistaken for its result.
+    engine.request_forecast();
+    engine.request_forecast();
+    // The learning thread fine-tunes, re-plans and reports a real-speed estimate, and the
+    // batch row gets the arm it was typed with.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while engine.view().real_wpm.is_none() || !engine.insights().model_ready {
+    loop {
+        let ready = engine.view().real_wpm.is_some() && engine.insights().model_ready;
+        let batch = engine.store().batches().unwrap().pop().unwrap();
+        if ready && batch.arm.is_some() {
+            assert!(batch.real_wpm.is_some());
+            break;
+        }
         assert!(Instant::now() < deadline, "no update from the learning thread");
         std::thread::sleep(Duration::from_millis(200));
     }
+    assert!(!engine.insights().learning_stopped);
+}
+
+/// The trainer values practice by what it prevents too: the same pair, practised equally
+/// often, is worth more when it was last typed weeks ago (about to be forgotten) than
+/// when it was typed today. Uses the shipped model.
+#[test]
+fn stale_pairs_are_worth_more_than_fresh_ones() {
+    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data");
+    let path = resources.join("models/typist.bpk");
+    let (model, loaded) = Brain::load_model(&[path.as_path()]);
+    assert!(loaded);
+    let layout = Layout::new(LayoutId::DeIso, Geometry::Iso);
+    let pool = Pool::default();
+    let now = 1_800_000_000_000i64;
+    let day = 86_400_000i64;
+    let history_at = |last_ms: i64| {
+        let mut h = PracticeHistory::default();
+        for i in 0..60 {
+            h.record(&layout, Some('e'), 'n', last_ms - (60 - i) * 1000, Some(180.0), false);
+        }
+        h
+    };
+    let device = reflex_core::model::cpu();
+    let key = pair_key(&layout, Some('e'), 'n').unwrap();
+    let fresh = compute_gains(&model, &history_at(now - 1000 * 60), &layout, &pool, now, &device).gain[&key];
+    let stale = compute_gains(&model, &history_at(now - 25 * day), &layout, &pool, now, &device).gain[&key];
+    assert!(stale > fresh, "stale {stale} vs fresh {fresh}");
 }
 
 fn input(c: char, key: Option<u8>, t_us: i64) -> KeyInput {

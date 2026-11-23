@@ -1,11 +1,15 @@
 #!/bin/zsh
 # Automated check of the built app: launches it in the background with a throwaway store,
-# types one line through the normal key path (wrong press first), exports CSV + JSON and
-# verifies both. Usage: tools/smoke.sh [path/to/Reflex.app]
+# types one line through the real key path (wrong press first, an ignored auto-repeat),
+# loads stats, exports CSV + JSON and verifies both. Usage: tools/smoke.sh [path/to/Reflex.app]
 set -euo pipefail
 app="${1:-$HOME/Applications/Reflex.app}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/reflex-smoke.XXXXXX")"
 report="$work/result.txt"
+# On failure or timeout: stop the test instance (only the one using this temp folder) and
+# remove the temp folder.
+cleanup() { pkill -f -- "--smoke-test $report" 2>/dev/null || true; rm -rf "$work"; }
+trap cleanup EXIT
 codesign --verify --strict "$app"
 open -g -n "$app" --args --smoke-test "$report"
 for _ in {1..30}; do
@@ -13,7 +17,7 @@ for _ in {1..30}; do
   sleep 1
 done
 if [[ ! -f "$report" ]]; then
-  echo "smoke: no result at $report" >&2
+  echo "smoke: no result after 30 s" >&2
   exit 1
 fi
 cat "$report"
@@ -39,4 +43,3 @@ for r, k in zip(rows, keys):
     assert r["typed"] == k["typed"] and (r["correct"] == "1") == k["correct"]
 print(f"smoke: {n} keystrokes verified in CSV and JSON")
 PY
-rm -rf "$work"

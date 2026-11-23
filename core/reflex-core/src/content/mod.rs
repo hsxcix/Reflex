@@ -69,6 +69,9 @@ pub enum ContentKind {
     Sentence,
     RealWorld,
     Code,
+    /// A held-out reference sentence typed as a measurement of real speed (never chosen
+    /// for practice value; see `trainer::probe`).
+    Probe,
 }
 
 impl ContentKind {
@@ -78,18 +81,19 @@ impl ContentKind {
             ContentKind::Sentence => "sentence",
             ContentKind::RealWorld => "realworld",
             ContentKind::Code => "code",
+            ContentKind::Probe => "probe",
         }
     }
 
     pub fn parse(s: &str) -> Option<ContentKind> {
-        [ContentKind::Words, ContentKind::Sentence, ContentKind::RealWorld, ContentKind::Code]
+        [ContentKind::Words, ContentKind::Sentence, ContentKind::RealWorld, ContentKind::Code, ContentKind::Probe]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
 
     /// Natural text is what "real speed" is measured on.
     pub fn is_natural(self) -> bool {
-        matches!(self, ContentKind::Sentence)
+        matches!(self, ContentKind::Sentence | ContentKind::Probe)
     }
 }
 

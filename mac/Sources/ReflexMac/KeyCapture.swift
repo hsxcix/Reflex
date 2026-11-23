@@ -9,24 +9,37 @@ struct CapturedKey {
     let modifiers: UInt32
     let timestampUs: Int64
     let isDead: Bool
+    /// The keyboard that sent the key is ISO (key left of "Z"); can change when an
+    /// external keyboard is used.
+    var iso: Bool = PhysicalKey.isISO
 }
 
 /// Invisible first-responder view that receives every key while the typing screen is shown.
 struct KeyCaptureView: NSViewRepresentable {
     var onKey: (CapturedKey) -> Void
     var onEscape: () -> Void
+    var onFlags: (NSEvent.ModifierFlags) -> Void = { _ in }
 
     func makeNSView(context: Context) -> KeyCaptureNSView {
         let view = KeyCaptureNSView()
-        view.onKey = onKey
-        view.onEscape = onEscape
+        update(view)
         return view
     }
 
     func updateNSView(_ view: KeyCaptureNSView, context: Context) {
+        update(view)
+        // Take focus back only if nothing else (a menu, a text field) holds it.
+        DispatchQueue.main.async {
+            if let window = view.window, window.firstResponder == nil || window.firstResponder === window {
+                window.makeFirstResponder(view)
+            }
+        }
+    }
+
+    private func update(_ view: KeyCaptureNSView) {
         view.onKey = onKey
         view.onEscape = onEscape
-        DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+        view.onFlags = onFlags
     }
 }
 
@@ -34,6 +47,7 @@ final class KeyCaptureNSView: NSView {
     var onKey: ((CapturedKey) -> Void)?
     var onEscape: (() -> Void)?
     var onTab: (() -> Void)?
+    var onFlags: ((NSEvent.ModifierFlags) -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -56,7 +70,11 @@ final class KeyCaptureNSView: NSView {
             onTab?()
             return
         }
-        guard let code = PhysicalKey.code(for: event.keyCode) else { return }
+        // A held key auto-repeats every ~30 ms: not a keystroke, and it would flood the
+        // model with fake presses.
+        if event.isARepeat { return }
+        let iso = PhysicalKey.isISO(event)
+        guard let code = PhysicalKey.code(for: event.keyCode, iso: iso) else { return }
         let chars = event.characters ?? ""
         let isDead = chars.isEmpty
         var modifiers: UInt32 = 0
@@ -67,26 +85,42 @@ final class KeyCaptureNSView: NSView {
             chars: code == "Enter" ? "\n" : chars,
             modifiers: modifiers,
             timestampUs: Int64(event.timestamp * 1_000_000),
-            isDead: isDead
+            isDead: isDead,
+            iso: iso
         ))
     }
 
-    // Swallow key-up and modifier changes so the system doesn't beep.
+    // Swallow key-up so the system doesn't beep; modifier changes report Caps Lock.
     override func keyUp(with event: NSEvent) {}
-    override func flagsChanged(with event: NSEvent) {}
+    override func flagsChanged(with event: NSEvent) { onFlags?(event.modifierFlags) }
 }
 
 /// macOS virtual key codes → W3C codes *by position* (what the core expects).
 enum PhysicalKey {
-    static let isISO: Bool = KBGetLayoutType(Int16(LMGetKbdType())) == kKeyboardISO
+    /// Form factor of the keyboard used last (asked fresh each time: external keyboards).
+    static var isISO: Bool { KBGetLayoutType(Int16(LMGetKbdType())) == kKeyboardISO }
 
-    static func code(for keyCode: UInt16) -> String? {
+    /// Form factor of the keyboard that sent `event`.
+    static func isISO(_ event: NSEvent) -> Bool {
+        guard let type = event.cgEvent?.getIntegerValueField(.keyboardEventKeyboardType), type > 0 else { return isISO }
+        return KBGetLayoutType(Int16(truncatingIfNeeded: type)) == kKeyboardISO
+    }
+
+    static func code(for keyCode: UInt16, iso: Bool = PhysicalKey.isISO) -> String? {
         let k = Int(keyCode)
+        let isISO = iso
         // On ISO keyboards macOS reports the key left of "1" as Section and the key left
         // of "Z" as Grave; by position they are Backquote and IntlBackslash.
         if k == kVK_ISO_Section { return isISO ? "Backquote" : "IntlBackslash" }
         if k == kVK_ANSI_Grave { return isISO ? "IntlBackslash" : "Backquote" }
         return table[k]
+    }
+
+    /// Virtual key code for a W3C code (inverse of `code(for:)`; used by the app check).
+    static func keyCode(for code: String, iso: Bool = PhysicalKey.isISO) -> UInt16? {
+        if code == "Backquote" { return UInt16(iso ? kVK_ISO_Section : kVK_ANSI_Grave) }
+        if code == "IntlBackslash" { return iso ? UInt16(kVK_ANSI_Grave) : nil }
+        return table.first { $0.value == code }.map { UInt16($0.key) }
     }
 
     private static let table: [Int: String] = [
@@ -107,19 +141,41 @@ enum PhysicalKey {
 
 /// Which keyboard layout is active, and notifications when it changes.
 enum InputSource {
-    static func current() -> (layout: String, geometry: String) {
-        let geometry = PhysicalKey.isISO ? "iso" : "ansi"
+    struct Current {
+        let layout: String
+        let geometry: String
+        /// Reflex has a table for this layout; otherwise it judges by the closest one.
+        let supported: Bool
+        /// The layout's name as macOS shows it (e.g. "Französisch").
+        let name: String
+    }
+
+    /// Exact macOS layout ids Reflex knows (the part after "com.apple.keylayout.").
+    private static let known: [String: String] = [
+        "german": "de-iso",
+        "austrian": "de-iso",
+        "us": "us-ansi",
+        "abc": "us-ansi",
+        "usextended": "us-ansi",
+        "usinternational-pc": "us-ansi",
+    ]
+
+    static func current(iso: Bool = PhysicalKey.isISO) -> Current {
+        let geometry = iso ? "iso" : "ansi"
+        let fallback = iso ? "de-iso" : "us-ansi"
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
-            return ("de-iso", geometry)
+            return Current(layout: fallback, geometry: geometry, supported: false, name: "?")
         }
         let id = (Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String).lowercased()
-        if id.contains("eurkey") { return ("eurkey", geometry) }
-        if id.contains("german") { return ("de-iso", geometry) }
-        if id.hasSuffix(".us") || id.contains("abc") || id.contains("usinternational") || id.contains(".us.") {
-            return ("us-ansi", geometry)
+        var name = id
+        if let n = TISGetInputSourceProperty(source, kTISPropertyLocalizedName) {
+            name = Unmanaged<CFString>.fromOpaque(n).takeUnretainedValue() as String
         }
-        return (geometry == "iso" ? "de-iso" : "us-ansi", geometry)
+        if id.contains("eurkey") { return Current(layout: "eurkey", geometry: geometry, supported: true, name: name) }
+        let short = id.components(separatedBy: "keylayout.").last ?? id
+        if let layout = known[short] { return Current(layout: layout, geometry: geometry, supported: true, name: name) }
+        return Current(layout: fallback, geometry: geometry, supported: false, name: name)
     }
 
     static func observe(_ handler: @escaping () -> Void) -> NSObjectProtocol {

@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 
 /// Gaps longer than this are pauses: not timed, not counted as active time.
 pub const PAUSE_US: i64 = 2_000_000;
+/// A break longer than this starts a new practice session (fatigue clock restarts).
+pub const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 /// A batch ends at the first line boundary after this much active typing.
 pub const BATCH_ACTIVE_SEC: f64 = 45.0;
 
@@ -95,7 +97,12 @@ pub struct TypingSession {
     /// Character typed right before the current line started.
     line_prev_char: Option<char>,
     session_sec: f64,
+    /// Counts practice sessions in this run (bumped after a break of [`SESSION_GAP_MS`]).
+    session_epoch: u32,
+    last_wall_ms: Option<i64>,
     batch: BatchTotals,
+    /// What the current line has added to `batch` so far (removed again if it is dropped).
+    line_totals: BatchTotals,
 }
 
 impl TypingSession {
@@ -114,7 +121,10 @@ impl TypingSession {
             prev_char: None,
             line_prev_char: None,
             session_sec: 0.0,
+            session_epoch: 0,
+            last_wall_ms: None,
             batch: BatchTotals::default(),
+            line_totals: BatchTotals::default(),
         }
     }
 
@@ -140,6 +150,11 @@ impl TypingSession {
         self.records.clear();
         self.keys.clear();
         self.error_positions.clear();
+        // The dropped line's chars, errors and time never count (its keys are abandoned).
+        self.batch.active_sec = (self.batch.active_sec - self.line_totals.active_sec).max(0.0);
+        self.batch.chars -= self.line_totals.chars.min(self.batch.chars);
+        self.batch.errors -= self.line_totals.errors.min(self.batch.errors);
+        self.line_totals = BatchTotals::default();
         had_progress
     }
 
@@ -170,6 +185,11 @@ impl TypingSession {
         self.session_sec
     }
 
+    /// Changes whenever a new practice session starts (after a long break).
+    pub fn session_epoch(&self) -> u32 {
+        self.session_epoch
+    }
+
     pub fn batch(&self) -> BatchTotals {
         self.batch
     }
@@ -191,11 +211,17 @@ impl TypingSession {
     /// Process one key event. Returns the outcome and, when a line was completed, the line.
     pub fn key(&mut self, input: &KeyInput) -> (KeyOutcome, Option<FinishedLine>) {
         let Some(expected) = self.expected() else { return (KeyOutcome::default(), None) };
+        if self.last_wall_ms.is_some_and(|t| input.wall_ms - t > SESSION_GAP_MS) {
+            self.session_sec = 0.0;
+            self.session_epoch += 1;
+        }
+        self.last_wall_ms = Some(input.wall_ms);
         let gap = self.last_us.map(|t| input.timestamp_us - t);
-        if let Some(g) = gap {
-            let active = g.clamp(0, PAUSE_US) as f64 / 1e6;
+        if let Some(g) = gap.filter(|g| (0..=PAUSE_US).contains(g)) {
+            let active = g as f64 / 1e6;
             self.session_sec += active;
             self.batch.active_sec += active;
+            self.line_totals.active_sec += active;
         }
         self.last_us = Some(input.timestamp_us);
         let correct = !input.is_dead && input.chars == expected.to_string();
@@ -243,6 +269,8 @@ impl TypingSession {
         });
         self.batch.chars += 1;
         self.batch.errors += self.attempt.error as u32;
+        self.line_totals.chars += 1;
+        self.line_totals.errors += self.attempt.error as u32;
         self.attempt = Attempt::default();
         self.last_correct_us = Some(input.timestamp_us);
         self.prev_char = Some(expected);
@@ -267,6 +295,7 @@ impl TypingSession {
         };
         self.pos = 0;
         self.error_positions.clear();
+        self.line_totals = BatchTotals::default();
         outcome.line_finished = true;
         outcome.batch_finished = self.batch.active_sec >= BATCH_ACTIVE_SEC;
         (outcome, Some(finished))
@@ -321,6 +350,82 @@ mod tests {
         s.key(&input("a", 0));
         s.key(&input("b", 5000));
         s.key(&input(" ", 5100));
-        assert!((s.batch().active_sec - 2.1).abs() < 1e-9);
+        // The 5 s gap is a pause: only the 0.1 s after it counts.
+        assert!((s.batch().active_sec - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn long_break_starts_a_new_session() {
+        let mut s = TypingSession::new(LayoutId::DeIso, Geometry::Iso);
+        s.push_line(PlannedLine::new("abcd", ContentKind::Words, Lang::De));
+        s.key(&input("a", 0));
+        s.key(&input("b", 1500));
+        assert!(s.session_sec() > 1.0);
+        let epoch = s.session_epoch();
+        // 40 minutes later (Mac never slept, app stayed open).
+        s.pause();
+        s.key(&input("c", 40 * 60 * 1000));
+        assert_eq!(s.session_sec(), 0.0);
+        assert_eq!(s.session_epoch(), epoch + 1);
+    }
+
+    #[test]
+    fn dropped_line_leaves_the_batch() {
+        let mut s = TypingSession::new(LayoutId::DeIso, Geometry::Iso);
+        s.push_line(PlannedLine::new("ab", ContentKind::Words, Lang::De));
+        s.push_line(PlannedLine::new("cd", ContentKind::Words, Lang::De));
+        for (c, t) in [("a", 0), ("b", 100), (" ", 200), ("c", 300), ("x", 400)] {
+            s.key(&input(c, t));
+        }
+        let before = s.batch();
+        assert_eq!((before.chars, before.errors), (4, 0));
+        assert!(s.drop_all_lines());
+        let after = s.batch();
+        // Only the finished first line remains.
+        assert_eq!((after.chars, after.errors), (3, 0));
+        assert!((after.active_sec - 0.2).abs() < 1e-9, "{}", after.active_sec);
+    }
+
+    /// Random key streams (right, wrong, dead keys, pauses) never break the invariants.
+    #[test]
+    fn random_key_streams_keep_invariants() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(11);
+        for round in 0..40 {
+            let mut s = TypingSession::new(LayoutId::DeIso, Geometry::Iso);
+            for text in ["über die Brücke", "a b", "Größe: 12 €", "x"] {
+                s.push_line(PlannedLine::new(text, ContentKind::Words, Lang::De));
+            }
+            let mut t = 0i64;
+            let mut finished_chars = 0u32;
+            let mut finished = 0;
+            for _ in 0..400 {
+                let Some(expected) = s.expected() else { break };
+                t += rng.random_range(30..400) + if rng.random_bool(0.03) { 5000 } else { 0 };
+                let roll = rng.random::<f64>();
+                let mut key = input(&expected.to_string(), t);
+                if roll < 0.15 {
+                    key.chars = "#".into();
+                } else if roll < 0.2 {
+                    key.chars = String::new();
+                    key.is_dead = true;
+                }
+                let line_len = s.lines().next().map_or(0, |l| l.text.chars().count());
+                let (outcome, line) = s.key(&key);
+                assert!(s.cursor() <= line_len, "round {round}");
+                assert!(!(key.is_dead && outcome.advanced), "dead keys never advance");
+                if let Some(line) = line {
+                    finished += 1;
+                    finished_chars += line.line.chars.len() as u32;
+                    assert_eq!(line.line.chars.len(), line.line.text.chars().count());
+                    assert!(line.line.chars.windows(2).all(|w| w[0].pos < w[1].pos));
+                    assert!(line.keys.iter().filter(|k| k.correct).count() == line.line.chars.len());
+                }
+            }
+            assert_eq!(finished, 4, "round {round}: all lines typed");
+            assert_eq!(s.batch().chars, finished_chars);
+            assert!(s.batch().active_sec >= 0.0);
+        }
     }
 }

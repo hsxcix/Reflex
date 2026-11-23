@@ -4,7 +4,7 @@
 
 mod worker;
 
-use crate::brain::Forecast;
+use crate::brain::{Forecast, LayoutSpeed};
 use crate::content::Pool;
 use crate::layout::{Geometry, Layout, LayoutId};
 use crate::record::TypedLine;
@@ -13,6 +13,7 @@ use crate::store::{BatchRecord, OpenLine, Store, StoreError};
 use crate::trainer::bandit::Trial;
 use crate::trainer::gains::GainTable;
 use crate::trainer::lines::RecentWords;
+use crate::trainer::probe::{PROBE_EVERY_LINES, probe_line};
 use crate::trainer::random::RandomSource;
 use crate::trainer::{LineSource, PlanContext};
 use rand::SeedableRng;
@@ -20,9 +21,9 @@ use rand::rngs::StdRng;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
-use worker::{Job, Update, WorkerSetup};
+use worker::{Job, Reply, Update, WorkerSetup};
 
 const VISIBLE_LINES: usize = 3;
 const QUEUED_LINES: usize = 4;
@@ -51,6 +52,10 @@ pub struct View {
     pub live_accuracy: f64,
     pub today_minutes: f64,
     pub real_wpm: Option<f64>,
+    /// Measured real speed from recent probe lines on this layout.
+    pub measured_wpm: Option<f64>,
+    /// The current line is a measurement (probe) line.
+    pub probe_line: bool,
 }
 
 /// What the learning side currently knows (for stats).
@@ -59,6 +64,10 @@ pub struct Insights {
     pub gains: Option<Arc<GainTable>>,
     pub forecast: Option<Forecast>,
     pub model_ready: bool,
+    pub measured_wpm: Option<f64>,
+    pub layout_speeds: Vec<LayoutSpeed>,
+    /// The learning thread ended unexpectedly: typing still works, nothing is learnt.
+    pub learning_stopped: bool,
 }
 
 pub struct Engine {
@@ -72,6 +81,10 @@ pub struct Engine {
     rng: StdRng,
     batch_lines: Vec<TypedLine>,
     recent_wpms: VecDeque<f64>,
+    /// Batch speeds of the current practice session (for the fatigue hint).
+    session_wpms: Vec<f64>,
+    session_epoch: u32,
+    lines_since_probe: usize,
     /// Active seconds on local day `today`.
     today_sec: f64,
     today: i64,
@@ -79,7 +92,6 @@ pub struct Engine {
     jobs: Sender<Job>,
     updates: Receiver<Update>,
     insights: Insights,
-    pending_real_wpm: bool,
     /// Exclusive lock on the data folder for as long as the engine lives: a second
     /// instance on the same data would mix up open keys.
     _lock: std::fs::File,
@@ -132,13 +144,16 @@ impl Engine {
             rng: StdRng::from_os_rng(),
             batch_lines: Vec::new(),
             recent_wpms,
+            session_wpms: Vec::new(),
+            session_epoch: 0,
+            // First probe after a few lines, not right at launch.
+            lines_since_probe: PROBE_EVERY_LINES / 2,
             today_sec,
             today,
             utc_offset_min,
             jobs,
             updates,
             insights: Insights::default(),
-            pending_real_wpm: false,
             _lock: lock,
         };
         engine.fill_queue();
@@ -147,6 +162,11 @@ impl Engine {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Read-only connection for slow queries (stats, export) outside the engine lock.
+    pub fn reader(&self) -> Result<Store, StoreError> {
+        self.store.reader()
     }
 
     pub fn layout(&self) -> &Layout {
@@ -251,9 +271,10 @@ impl Engine {
             return Ok((outcome, None));
         }
         let totals = self.session.take_batch();
-        let summary = self.close_batch(totals)?;
+        let (batch_id, summary) = self.close_batch(totals)?;
         self.jobs
             .send(Job::Batch {
+                batch_id,
                 lines: std::mem::take(&mut self.batch_lines),
                 minutes: totals.active_sec / 60.0,
                 layout: self.layout.clone(),
@@ -261,7 +282,6 @@ impl Engine {
                 now_ms: now_ms(),
             })
             .ok();
-        self.pending_real_wpm = true;
         Ok((outcome, Some(summary)))
     }
 
@@ -274,20 +294,25 @@ impl Engine {
         Ok(id)
     }
 
-    fn close_batch(&mut self, totals: BatchTotals) -> Result<BatchSummary, StoreError> {
+    fn close_batch(&mut self, totals: BatchTotals) -> Result<(i64, BatchSummary), StoreError> {
         let wpm = totals.wpm();
         let avg = if self.recent_wpms.is_empty() {
             wpm
         } else {
             self.recent_wpms.iter().sum::<f64>() / self.recent_wpms.len() as f64
         };
-        let fatigue_hint = crate::stats::fatigue(&self.recent_wpms, wpm, self.session.session_sec());
+        if self.session.session_epoch() != self.session_epoch {
+            self.session_epoch = self.session.session_epoch();
+            self.session_wpms.clear();
+        }
+        let fatigue_hint = crate::stats::fatigue(&self.session_wpms, wpm, self.session.session_sec());
+        self.session_wpms.push(wpm);
         self.recent_wpms.push_front(wpm);
         self.recent_wpms.truncate(10);
         self.roll_day();
         self.today_sec += totals.active_sec;
         let real_wpm = self.real_wpm();
-        self.store.insert_batch(&BatchRecord {
+        let id = self.store.insert_batch(&BatchRecord {
             session_id: self.session_id.unwrap_or(0),
             ended_ms: now_ms(),
             seconds: totals.active_sec,
@@ -298,8 +323,9 @@ impl Engine {
             real_wpm,
             arm: None,
             utc_offset_min: Some(self.utc_offset_min),
+            probe_wpm: None,
         })?;
-        Ok(BatchSummary { wpm, accuracy: totals.accuracy(), trend: wpm - avg, real_wpm, fatigue_hint })
+        Ok((id, BatchSummary { wpm, accuracy: totals.accuracy(), trend: wpm - avg, real_wpm, fatigue_hint }))
     }
 
     fn real_wpm(&self) -> Option<f64> {
@@ -308,26 +334,41 @@ impl Engine {
 
     /// Apply results from the learning thread.
     fn poll(&mut self) {
-        while let Ok(update) = self.updates.try_recv() {
-            if let Some(planner) = update.planner {
-                // Swap the trainer for future lines; visible lines stay as they are.
-                self.source = Box::new(planner);
-                self.insights.model_ready = true;
-            }
-            if let Some(trials) = update.trials
-                && let Ok(json) = serde_json::to_string(&trials) {
-                    self.store.set_setting(TRIALS_KEY, &json).ok();
+        loop {
+            match self.updates.try_recv() {
+                Ok(update) => self.apply(update),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.insights.learning_stopped = true;
+                    break;
                 }
-            self.insights.gains = Some(update.gains);
-            if update.forecast.is_some() {
-                self.insights.forecast = update.forecast;
             }
-            if self.pending_real_wpm {
-                if let Some(real) = self.real_wpm() {
-                    self.store.update_last_batch(real, Some(update.arm as u32)).ok();
-                }
-                self.pending_real_wpm = false;
-            }
+        }
+    }
+
+    fn apply(&mut self, update: Update) {
+        if let Some(planner) = update.planner {
+            // Swap the trainer for future lines; visible lines stay as they are.
+            self.source = Box::new(planner);
+            self.insights.model_ready = true;
+        }
+        if let Some(trials) = update.trials
+            && let Ok(json) = serde_json::to_string(&trials)
+        {
+            self.store.set_setting(TRIALS_KEY, &json).ok();
+        }
+        self.insights.gains = Some(update.gains);
+        if update.forecast.is_some() {
+            self.insights.forecast = update.forecast;
+        }
+        self.insights.measured_wpm = update.measured_wpm;
+        if !update.layout_speeds.is_empty() {
+            self.insights.layout_speeds = update.layout_speeds;
+        }
+        // Only a batch reply carries that batch's results, and it names its batch row.
+        if let Reply::Batch { batch_id, outcome } = update.reply {
+            let real = self.real_wpm();
+            self.store.update_batch(batch_id, real, Some(outcome.played_arm as u32), outcome.probe_wpm).ok();
         }
     }
 
@@ -343,6 +384,8 @@ impl Engine {
             live_accuracy: totals.accuracy(),
             today_minutes: (self.today_sec + totals.active_sec) / 60.0,
             real_wpm: self.real_wpm(),
+            measured_wpm: self.insights.measured_wpm,
+            probe_line: self.session.lines().next().is_some_and(|l| l.kind == crate::content::ContentKind::Probe),
         }
     }
 
@@ -361,8 +404,15 @@ impl Engine {
 
     fn fill_queue(&mut self) {
         while self.session.queued() < QUEUED_LINES {
-            let ctx = PlanContext { pool: &self.pool, layout: &self.layout, recent: &self.recent };
-            let line = self.source.next_line(&ctx, &mut self.rng);
+            self.lines_since_probe += 1;
+            let line = if self.lines_since_probe >= PROBE_EVERY_LINES {
+                // A measurement line: held-out sentence, never chosen for practice value.
+                self.lines_since_probe = 0;
+                probe_line(&self.pool, &self.layout, &mut self.rng)
+            } else {
+                let ctx = PlanContext { pool: &self.pool, layout: &self.layout, recent: &self.recent };
+                self.source.next_line(&ctx, &mut self.rng)
+            };
             self.recent.note_line(&line.text);
             self.session.push_line(line);
         }

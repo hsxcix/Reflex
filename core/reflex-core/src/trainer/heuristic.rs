@@ -42,7 +42,7 @@ impl LineSource for WeakestKeys {
         let lang = ctx.pool.pick_language(rng);
         let mix = Mix { sentence: 0.3, real_world: 0.06, code: 0.15 };
         match mix.pick(ctx.pool, rng) {
-            ContentKind::Sentence => lines::sentence_line(lang, ctx.layout, |_| 0.0, 1, rng),
+            ContentKind::Sentence | ContentKind::Probe => lines::sentence_line(lang, ctx.layout, |_| 0.0, 1, rng),
             ContentKind::RealWorld => lines::real_world(lang, ctx.layout, rng),
             ContentKind::Code => lines::code_line(lang, ctx.layout, |_| 0.0, rng),
             ContentKind::Words => {

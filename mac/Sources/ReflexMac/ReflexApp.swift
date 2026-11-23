@@ -26,10 +26,26 @@ struct ReflexApp: App {
                     .keyboardShortcut("e", modifiers: [.command, .shift, .option])
             }
             CommandMenu("Practice") {
-                Button("Type") { model.screen = .typing }
+                Button("Type") { model.showTyping() }
                     .keyboardShortcut("1", modifiers: .command)
                 Button("Progress") { model.showStats() }
                     .keyboardShortcut("2", modifiers: .command)
+                Divider()
+                // Everything in the top bar, reachable from the keyboard.
+                Toggle("German Text", isOn: Binding(get: { model.pool.languages.contains("de") },
+                                                     set: { model.setLanguage("de", on: $0) }))
+                    .keyboardShortcut("d", modifiers: [.command, .option])
+                Toggle("English Text", isOn: Binding(get: { model.pool.languages.contains("en") },
+                                                      set: { model.setLanguage("en", on: $0) }))
+                    .keyboardShortcut("e", modifiers: [.command, .option])
+                Picker("Vocabulary", selection: Binding(get: { model.pool.vocabulary }, set: { model.setVocabulary($0) })) {
+                    Text("Common Words").tag("common").keyboardShortcut("1", modifiers: [.command, .option])
+                    Text("Broad Vocabulary").tag("broad").keyboardShortcut("2", modifiers: [.command, .option])
+                    Text("Full Vocabulary").tag("full").keyboardShortcut("3", modifiers: [.command, .option])
+                }
+                .pickerStyle(.inline)
+                Toggle("Code", isOn: Binding(get: { model.pool.code }, set: { if $0 != model.pool.code { model.toggleCode() } }))
+                    .keyboardShortcut("c", modifiers: [.command, .option])
             }
         }
     }

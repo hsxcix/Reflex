@@ -66,7 +66,8 @@ pub fn train(
     model
 }
 
-/// Mean loss on `data` without bootstrap noise (lower = better predictions).
+/// Mean prediction loss on `data` without bootstrap noise or regulariser (lower = better
+/// predictions). Can be negative (Gaussian NLL).
 pub fn evaluate(model: &TypistModel, data: &[EncodedLine], device: &Device) -> f32 {
     if data.is_empty() {
         return f32::NAN;
@@ -78,7 +79,7 @@ pub fn evaluate(model: &TypistModel, data: &[EncodedLine], device: &Device) -> f
         let batch = make_batch(chunk, device);
         let [b, t] = batch.pad.dims();
         let ones = Tensor::<3>::ones([b, t, ENSEMBLE], device);
-        total += scalar(&model.loss(&batch, ones)) * chunk.len() as f32;
+        total += scalar(&model.data_loss(&batch, ones)) * chunk.len() as f32;
         n += chunk.len() as f32;
     }
     total / n

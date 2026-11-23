@@ -21,7 +21,7 @@ impl LineSource for RandomSource {
     fn next_line(&mut self, ctx: &PlanContext, rng: &mut StdRng) -> PlannedLine {
         let lang = ctx.pool.pick_language(rng);
         match self.mix.pick(ctx.pool, rng) {
-            ContentKind::Sentence => lines::sentence_line(lang, ctx.layout, |_| 0.0, 1, rng),
+            ContentKind::Sentence | ContentKind::Probe => lines::sentence_line(lang, ctx.layout, |_| 0.0, 1, rng),
             ContentKind::RealWorld => lines::real_world(lang, ctx.layout, rng),
             ContentKind::Code => lines::code_line(lang, ctx.layout, |_| 0.0, rng),
             ContentKind::Words => {
