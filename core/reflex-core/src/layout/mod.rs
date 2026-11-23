@@ -123,7 +123,7 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(id: LayoutId, geometry: Geometry) -> Layout {
-        let outputs = parse_table(id.table());
+        let outputs = outputs(id, geometry);
         let mut direct: HashMap<char, Stroke> = HashMap::new();
         let mut dead: Vec<(char, Stroke)> = Vec::new();
         // Iterate cheapest layer first so the easiest stroke wins.
@@ -187,7 +187,7 @@ impl Layout {
 
     /// Which character a key produces on the base layer (for the on-screen keyboard).
     pub fn label(&self, key: KeyId, layer: Layer) -> Option<String> {
-        let outputs = parse_table(self.id.table());
+        let outputs = outputs(self.id, self.geometry);
         outputs.iter().find(|(k, _)| *k == key).and_then(|(_, layers)| match layers[layer as usize] {
             Some(Output::Char(' ')) => Some(String::new()),
             Some(Output::Char(c)) => Some(c.to_string()),
@@ -195,6 +195,24 @@ impl Layout {
             None => None,
         })
     }
+}
+
+/// Key outputs of a layout on a geometry. Apple's U.S. layout on ISO hardware puts `§`
+/// left of "1" and `` ` `` left of "Z" (checked with UCKeyTranslate, tools/check_layouts.sh);
+/// the table describes ANSI hardware, so the two keys swap on ISO.
+fn outputs(id: LayoutId, geometry: Geometry) -> Vec<(KeyId, [Option<Output>; 4])> {
+    let mut outputs = parse_table(id.table());
+    if id == LayoutId::UsAnsi && geometry == Geometry::Iso {
+        let (grave, intl) = (key_id("Backquote").unwrap(), key_id("IntlBackslash").unwrap());
+        for (key, _) in &mut outputs {
+            if *key == grave {
+                *key = intl;
+            } else if *key == intl {
+                *key = grave;
+            }
+        }
+    }
+    outputs
 }
 
 fn parse_table(table: &str) -> Vec<(KeyId, [Option<Output>; 4])> {
@@ -271,6 +289,17 @@ mod tests {
         assert_eq!((KEY_CODES[ae[0].key as usize], ae[0].layer), ("KeyU", Layer::Option));
         assert_eq!(ae[1].layer, Layer::Shift);
         assert!(l.can_type("Größe {x} = 5 € @home"));
+    }
+
+    #[test]
+    fn us_on_iso_hardware_matches_macos() {
+        let iso = Layout::new(LayoutId::UsAnsi, Geometry::Iso);
+        assert_eq!(iso.main_stroke('`').unwrap().key, key_id("IntlBackslash").unwrap());
+        assert_eq!(iso.main_stroke('§').unwrap().key, key_id("Backquote").unwrap());
+        assert_eq!(iso.label(key_id("Backquote").unwrap(), Layer::Base).as_deref(), Some("§"));
+        let ansi = Layout::new(LayoutId::UsAnsi, Geometry::Ansi);
+        assert_eq!(ansi.main_stroke('`').unwrap().key, key_id("Backquote").unwrap());
+        assert_ne!(ansi.main_stroke('§').unwrap().key, key_id("Backquote").unwrap()); // ⌥6 on ANSI
     }
 
     #[test]

@@ -14,6 +14,7 @@ Plan: PLAN.md · decisions log: DECISIONS.md (append with date + reason when dec
 - `./build.sh` builds core + app, installs `~/Applications/Reflex.app`, launches it with `open -g` (no focus steal). `--no-open` to skip launch, `--smoke` to run the app check instead. Env: `REFLEX_INSTALL_DIR`, `CARGO_HOME`.
 - App check: `tools/smoke.sh [app]` starts the app with `--smoke-test` against a temp store (types one line incl. a wrong press, exports CSV+JSON, verifies both). `REFLEX_DATA=<dir>` points the app at another data folder.
 - Core tests: `cd core && cargo test -p reflex-core`.
+- Layout tables vs real macOS layouts: `tools/check_layouts.sh` (run after editing `core/data/layouts`).
 - Rust lives at `/opt/homebrew/opt/rustup/bin` (rustup via Homebrew; not on PATH by default).
 - User data: `~/Library/Application Support/Reflex/reflex.sqlite` (every keystroke, never auto-deleted; schema v3: `open_keys` while typing, `abandoned_keys` after a quit or layout switch mid-line, per-batch `utc_offset_min`). `reflex.lock` allows one instance per data folder.
 - Real speed is measured on held-out reference sentences (`Corpus::reference_sentences`), never practised. Days use the local UTC offset passed in from the app.
